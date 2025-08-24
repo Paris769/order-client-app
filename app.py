@@ -13,7 +13,7 @@ Example usage:
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 from io import BytesIO
 from typing import List, Optional
 
@@ -85,7 +85,9 @@ def main() -> None:
         parsed_orders: List[pd.DataFrame] = []
         for uploaded in new_files:
             try:
-                suffix = os.path.splitext(uploaded.name)[1].lower()
+                # Use pathlib to determine the file suffix instead of os.path, to avoid
+                # relying on the os module which can be sandboxed on some platforms.
+                suffix = Path(uploaded.name).suffix.lower()
                 df: Optional[pd.DataFrame] = None
                 if suffix in [".xls", ".xlsx", ".csv"]:
                     df = parse_excel(uploaded)
@@ -133,9 +135,10 @@ def main() -> None:
         # directory. Writing to /home/oai/share is not allowed on Streamlit Cloud.
         buffer = BytesIO()
         import tempfile  # use tempfile to determine a writable temporary directory
-        # Determine a temporary path for the export file
+        # Determine a temporary path for the export file.
         temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, "sap_export.xlsx")
+        # Build the temporary file path using pathlib instead of os.path.join
+        temp_path = str(Path(temp_dir) / "sap_export.xlsx")
         export_path = export_to_sap(result_df, path=temp_path)
         # Read the file into the BytesIO buffer
         with open(export_path, "rb") as f:
