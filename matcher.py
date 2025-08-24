@@ -28,11 +28,23 @@ class OrderMatcher:
             Absolute z‑score above which a quantity is considered anomalous.
             Default is 3.0 (roughly 3 standard deviations).
         """
+        # Make a copy of history and normalise key types
         self.history = history_df.copy()
         self.qty_zscore_threshold = qty_zscore_threshold
-        # Compute mean and std for quantity ordered per customer+item
+
+        # Ensure merge keys are consistently typed as strings. Without this
+        # normalisation, merging new orders with historical stats can raise
+        # ValueError when one side is numeric and the other is object (e.g.
+        # int64 vs object). Cast both customer and item codes to string
+        # before computing statistics.
         key = ["customer_code", "item_code"]
-        # Filter rows with numeric quantities
+        for k in key:
+            if k in self.history.columns:
+                # Cast to string; preserve NaNs (astype(str) would convert
+                # NaN to 'nan'), so use pandas string type where possible
+                self.history[k] = self.history[k].astype(str)
+
+        # Filter rows with numeric quantities and compute stats per customer+item
         qty_series = pd.to_numeric(self.history.get("qty_ordered"), errors="coerce")
         self.history["qty_ordered_num"] = qty_series
         grouped = self.history.groupby(key)["qty_ordered_num"].agg(["mean", "std"]).reset_index()
@@ -59,9 +71,15 @@ class OrderMatcher:
             - flags: comma‑separated list of flags such as "UNKNOWN_ITEM" or "QTY_ANOM"
         """
         df = orders_df.copy()
-        # Ensure numeric
-        df["qty_ordered"] = pd.to_numeric(df["qty_ordered"], errors="coerce")
+        # Cast merge keys to string to align with history dtype. Without this
+        # casting the merge can fail if, for example, the new orders have
+        # item codes as strings while the history contains integers.
         key = ["customer_code", "item_code"]
+        for k in key:
+            if k in df.columns:
+                df[k] = df[k].astype(str)
+        # Ensure quantity is numeric
+        df["qty_ordered"] = pd.to_numeric(df["qty_ordered"], errors="coerce")
         merged = pd.merge(df, self.stats, on=key, how="left")
         # Compute z‑score where stats are available
         merged["qty_zscore"] = (merged["qty_ordered"] - merged["qty_mean"]) / merged["qty_std"]
