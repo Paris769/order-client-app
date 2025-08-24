@@ -132,8 +132,7 @@ def main() -> None:
         # Export the SAP-ready DataFrame to a temporary file in a writable
         # directory. Writing to /home/oai/share is not allowed on Streamlit Cloud.
         buffer = BytesIO()
-        import os
-        import tempfile
+        import tempfile  # use tempfile to determine a writable temporary directory
         # Determine a temporary path for the export file
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, "sap_export.xlsx")
