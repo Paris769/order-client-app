@@ -129,11 +129,19 @@ def main() -> None:
             st.success("Nessuna anomalia rilevata nei nuovi ordini.")
 
         # Offer download
-        # Write export to a BytesIO so it doesn't persist on disk unnecessarily
+        # Export the SAP-ready DataFrame to a temporary file in a writable
+        # directory. Writing to /home/oai/share is not allowed on Streamlit Cloud.
         buffer = BytesIO()
-        export_path = export_to_sap(result_df, path="/home/oai/share/_temp_sap_export.xlsx")
+        import os
+        import tempfile
+        # Determine a temporary path for the export file
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, "sap_export.xlsx")
+        export_path = export_to_sap(result_df, path=temp_path)
+        # Read the file into the BytesIO buffer
         with open(export_path, "rb") as f:
             buffer.write(f.read())
+        # Present a download button with the binary content
         st.download_button(
             label="Scarica file per SAP",
             data=buffer.getvalue(),
