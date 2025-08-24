@@ -1,0 +1,146 @@
+"""Streamlit interface for auditing customer orders.
+
+This application allows users to upload a historical order file and one or
+more new order documents (Excel, PDF, text). It then analyses the new
+orders against historical quantities to identify unknown items and
+quantity anomalies. Users can download an Excel file containing the
+results in a format suitable for importing into SAP or other ERP systems.
+
+Example usage:
+
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import os
+from io import BytesIO
+from typing import List, Optional
+
+import pandas as pd  # type: ignore
+import streamlit as st  # type: ignore
+
+from parsers import parse_excel, parse_pdf, parse_text
+from matcher import OrderMatcher
+from sap_exporter import export_to_sap
+
+
+def main() -> None:
+    st.set_page_config(page_title="Order Audit App", layout="wide")
+    st.title("Order Audit App")
+    st.write(
+        """
+        Carica un file Excel con lo storico degli ordini (cliente, articolo,
+        descrizione, quantità spedita e quantità ordinata) e una o più nuove
+        conferme d'ordine in formato Excel, PDF o testo. L'applicazione
+        confronterà i nuovi ordini con lo storico per evidenziare articoli
+        sconosciuti o quantità anomale. Alla fine potrai scaricare un file
+        pronto per l'import in SAP.
+        """
+    )
+
+    # Sidebar inputs
+    st.sidebar.header("Dati di ingresso")
+    hist_file = st.sidebar.file_uploader(
+        "Carica lo storico degli ordini (Excel)",
+        type=["xls", "xlsx"],
+    )
+    # Input for default customer code (for files that don't contain it)
+    default_customer_code = st.sidebar.text_input(
+        "Codice cliente predefinito per file senza colonna cliente", value=""
+    )
+
+    new_files = st.sidebar.file_uploader(
+        "Carica nuovi ordini (PDF, testo o Excel)",
+        type=["pdf", "txt", "xls", "xlsx", "csv"],
+        accept_multiple_files=True,
+    )
+
+    if hist_file is None:
+        st.info("Per favore carica un file Excel con lo storico degli ordini.")
+        return
+
+    # Parse historical data
+    try:
+        hist_df = parse_excel(hist_file)
+    except Exception as e:
+        st.error(f"Errore nel caricamento dello storico: {e}")
+        return
+
+    if hist_df.empty:
+        st.warning("Lo storico degli ordini sembra vuoto o non contiene le colonne attese.")
+        return
+
+    st.sidebar.success(f"Storico caricato: {len(hist_df)} righe")
+
+    # Show a preview of the historical data
+    with st.expander("Anteprima dello storico", expanded=False):
+        st.dataframe(hist_df.head())
+
+    # Instantiate matcher
+    matcher = OrderMatcher(hist_df)
+
+    # If there are new files, parse them
+    if new_files:
+        parsed_orders: List[pd.DataFrame] = []
+        for uploaded in new_files:
+            try:
+                suffix = os.path.splitext(uploaded.name)[1].lower()
+                df: Optional[pd.DataFrame] = None
+                if suffix in [".xls", ".xlsx", ".csv"]:
+                    df = parse_excel(uploaded)
+                elif suffix == ".pdf":
+                    df = parse_pdf(uploaded)
+                elif suffix in [".txt", ".text"]:
+                    df = parse_text(uploaded)
+                else:
+                    st.warning(f"Formato non supportato per {uploaded.name}")
+                if df is not None and not df.empty:
+                    # If missing customer_code, inject default
+                    if "customer_code" not in df.columns or df["customer_code"].isna().all():
+                        if default_customer_code:
+                            df["customer_code"] = default_customer_code
+                        else:
+                            st.warning(
+                                f"Il file {uploaded.name} non contiene il codice cliente e non è stato specificato un valore predefinito."
+                            )
+                    parsed_orders.append(df)
+            except Exception as e:
+                st.warning(f"Errore nel parsing di {uploaded.name}: {e}")
+        if not parsed_orders:
+            st.info("Nessun nuovo ordine valido da analizzare.")
+            return
+        # Concatenate all parsed orders
+        new_df = pd.concat(parsed_orders, ignore_index=True)
+        # Display new orders
+        st.subheader("Nuovi ordini caricati")
+        st.dataframe(new_df)
+
+        # Match against history
+        result_df = matcher.match(new_df)
+        st.subheader("Risultati dell'analisi")
+        st.dataframe(result_df)
+        # Show flagged rows
+        flagged = result_df[result_df["flags"] != ""]
+        if not flagged.empty:
+            st.subheader("Righe con avvisi")
+            st.dataframe(flagged)
+        else:
+            st.success("Nessuna anomalia rilevata nei nuovi ordini.")
+
+        # Offer download
+        # Write export to a BytesIO so it doesn't persist on disk unnecessarily
+        buffer = BytesIO()
+        export_path = export_to_sap(result_df, path="/home/oai/share/_temp_sap_export.xlsx")
+        with open(export_path, "rb") as f:
+            buffer.write(f.read())
+        st.download_button(
+            label="Scarica file per SAP",
+            data=buffer.getvalue(),
+            file_name="sap_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+if __name__ == "__main__":
+    main()
