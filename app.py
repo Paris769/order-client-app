@@ -56,6 +56,15 @@ def main() -> None:
         accept_multiple_files=True,
     )
 
+    # Optional text area for manual order entry. Users can paste their order
+    # details here when no file is available. Expected format per line:
+    # <codice> <descrizione> <quantità>
+    manual_text = st.sidebar.text_area(
+        "Oppure inserisci l'ordine in forma testuale (una riga per ordine: codice descrizione quantità)",
+        value="",
+        height=150,
+    )
+
     if hist_file is None:
         st.info("Per favore carica un file Excel con lo storico degli ordini.")
         return
@@ -80,9 +89,10 @@ def main() -> None:
     # Instantiate matcher
     matcher = OrderMatcher(hist_df)
 
-    # If there are new files, parse them
+    # Collect and parse all new orders from uploaded files and manual text
+    parsed_orders: List[pd.DataFrame] = []
+    # Parse uploaded files if any
     if new_files:
-        parsed_orders: List[pd.DataFrame] = []
         for uploaded in new_files:
             try:
                 # Use pathlib to determine the file suffix instead of os.path, to avoid
@@ -109,47 +119,64 @@ def main() -> None:
                     parsed_orders.append(df)
             except Exception as e:
                 st.warning(f"Errore nel parsing di {uploaded.name}: {e}")
-        if not parsed_orders:
-            st.info("Nessun nuovo ordine valido da analizzare.")
-            return
-        # Concatenate all parsed orders
-        new_df = pd.concat(parsed_orders, ignore_index=True)
-        # Display new orders
-        st.subheader("Nuovi ordini caricati")
-        st.dataframe(new_df)
+    # Parse manual text input if provided
+    if manual_text and manual_text.strip():
+        try:
+            text_df = parse_text(manual_text)
+            if text_df is not None and not text_df.empty:
+                # Inject default customer code if missing
+                if "customer_code" not in text_df.columns or text_df["customer_code"].isna().all():
+                    if default_customer_code:
+                        text_df["customer_code"] = default_customer_code
+                    else:
+                        st.warning(
+                            "L'ordine testuale non contiene il codice cliente e non è stato specificato un valore predefinito."
+                        )
+                parsed_orders.append(text_df)
+        except Exception as e:
+            st.warning(f"Errore nel parsing del testo inserito manualmente: {e}")
 
-        # Match against history
-        result_df = matcher.match(new_df)
-        st.subheader("Risultati dell'analisi")
-        st.dataframe(result_df)
-        # Show flagged rows
-        flagged = result_df[result_df["flags"] != ""]
-        if not flagged.empty:
-            st.subheader("Righe con avvisi")
-            st.dataframe(flagged)
-        else:
-            st.success("Nessuna anomalia rilevata nei nuovi ordini.")
+    if not parsed_orders:
+        st.info("Nessun nuovo ordine valido da analizzare.")
+        return
+    # Concatenate all parsed orders
+    new_df = pd.concat(parsed_orders, ignore_index=True)
+    # Display new orders
+    st.subheader("Nuovi ordini caricati")
+    st.dataframe(new_df)
 
-        # Offer download
-        # Export the SAP-ready DataFrame to a temporary file in a writable
-        # directory. Writing to /home/oai/share is not allowed on Streamlit Cloud.
-        buffer = BytesIO()
-        import tempfile  # use tempfile to determine a writable temporary directory
-        # Determine a temporary path for the export file.
-        temp_dir = tempfile.gettempdir()
-        # Build the temporary file path using pathlib instead of os.path.join
-        temp_path = str(Path(temp_dir) / "sap_export.xlsx")
-        export_path = export_to_sap(result_df, path=temp_path)
-        # Read the file into the BytesIO buffer
-        with open(export_path, "rb") as f:
-            buffer.write(f.read())
-        # Present a download button with the binary content
-        st.download_button(
-            label="Scarica file per SAP",
-            data=buffer.getvalue(),
-            file_name="sap_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    # Match against history
+    result_df = matcher.match(new_df)
+    st.subheader("Risultati dell'analisi")
+    st.dataframe(result_df)
+    # Show flagged rows
+    flagged = result_df[result_df["flags"] != ""]
+    if not flagged.empty:
+        st.subheader("Righe con avvisi")
+        st.dataframe(flagged)
+    else:
+        st.success("Nessuna anomalia rilevata nei nuovi ordini.")
+
+    # Offer download
+    # Export the SAP-ready DataFrame to a temporary file in a writable
+    # directory. Writing to /home/oai/share is not allowed on Streamlit Cloud.
+    buffer = BytesIO()
+    import tempfile  # use tempfile to determine a writable temporary directory
+    # Determine a temporary path for the export file.
+    temp_dir = tempfile.gettempdir()
+    # Build the temporary file path using pathlib instead of os.path.join
+    temp_path = str(Path(temp_dir) / "sap_export.xlsx")
+    export_path = export_to_sap(result_df, path=temp_path)
+    # Read the file into the BytesIO buffer
+    with open(export_path, "rb") as f:
+        buffer.write(f.read())
+    # Present a download button with the binary content
+    st.download_button(
+        label="Scarica file per SAP",
+        data=buffer.getvalue(),
+        file_name="sap_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 if __name__ == "__main__":

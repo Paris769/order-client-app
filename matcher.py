@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
+import difflib
+from typing import List, Dict
 
 
 class OrderMatcher:
@@ -50,6 +52,20 @@ class OrderMatcher:
         grouped = self.history.groupby(key)["qty_ordered_num"].agg(["mean", "std"]).reset_index()
         grouped.rename(columns={"mean": "qty_mean", "std": "qty_std"}, inplace=True)
         self.stats = grouped
+        # Compute description-level statistics. If item_code is missing,
+        # statistics based on the item description will be used instead.
+        desc_grouped = (
+            self.history.groupby("item_description")["qty_ordered_num"]
+            .agg(["mean", "std"])
+            .reset_index()
+        )
+        # Remove entries where mean or std is NaN
+        desc_grouped = desc_grouped.dropna(subset=["mean", "std"])
+        # Build a dict keyed by lower-case description for quick lookup
+        self.desc_stats: Dict[str, Dict[str, float]] = {}
+        for _, row in desc_grouped.iterrows():
+            desc_key = str(row["item_description"]).lower()
+            self.desc_stats[desc_key] = {"mean": row["mean"], "std": row["std"]}
 
     def match(self, orders_df: pd.DataFrame) -> pd.DataFrame:
         """Compare new orders against historical stats.
@@ -81,15 +97,29 @@ class OrderMatcher:
         # Ensure quantity is numeric
         df["qty_ordered"] = pd.to_numeric(df["qty_ordered"], errors="coerce")
         merged = pd.merge(df, self.stats, on=key, how="left")
-        # Compute z‑score where stats are available
+        # Fill missing stats using description-level statistics
+        merged["desc_used"] = False
+        # Iterate only on rows where qty_mean is NaN
+        na_idx = merged["qty_mean"].isna()
+        for idx in merged[na_idx].index:
+            desc = str(merged.at[idx, "item_description"]).lower()
+            stats = self.desc_stats.get(desc)
+            if stats:
+                merged.at[idx, "qty_mean"] = stats["mean"]
+                merged.at[idx, "qty_std"] = stats["std"]
+                merged.at[idx, "desc_used"] = True
+        # Compute z‑score where stats are available (including desc stats)
         merged["qty_zscore"] = (merged["qty_ordered"] - merged["qty_mean"]) / merged["qty_std"]
         # Determine flags
         def flag_row(row) -> str:
             flags: List[str] = []
-            # Unknown item means no history entry
+            # Unknown item means no history entry and no description stats
             if pd.isna(row["qty_mean"]):
                 flags.append("UNKNOWN_ITEM")
             else:
+                # If description stats were used, flag accordingly
+                if row.get("desc_used"):
+                    flags.append("DESC_MATCH")
                 # Avoid division by zero: std could be zero if all historical quantities
                 # are the same; in that case any difference counts as anomaly
                 z = row["qty_zscore"]

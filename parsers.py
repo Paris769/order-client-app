@@ -166,7 +166,10 @@ def parse_text(uploaded_file) -> pd.DataFrame:
         injected elsewhere as text files rarely include it.
     """
     content: str
-    if hasattr(uploaded_file, "read"):
+    # If a plain string is provided, treat it as the content itself
+    if isinstance(uploaded_file, str):
+        content = uploaded_file
+    elif hasattr(uploaded_file, "read"):
         # streamlit returns a BytesIO; decode bytes
         raw = uploaded_file.read()
         try:
