@@ -112,12 +112,80 @@ class OrderMatcher:
             cust_desc_to_code[(str(cust), str(desc).lower())] = code_str
         self.global_desc_to_code = global_desc_to_code
         self.cust_desc_to_code = cust_desc_to_code
-        # Build a set of known (customer_code, item_code) pairs to quickly identify
-        # whether a new order item exists in the history. Cast both parts to string
-        # for consistent comparisons.
-        self.known_pairs = set(
-            zip(self.history["customer_code"].astype(str), self.history["item_code"].astype(str))
+
+        # Precompute total quantity ordered per item_code across all customers. This will be
+        # used to weight description‑similarity matches when a code is not found via
+        # customer or global description mappings. Casting codes to string ensures
+        # consistent keys when codes are numeric.
+        self.code_qty_totals: Dict[str, float] = (
+            self.history.groupby("item_code")["qty_ordered_num"].sum().astype(float).to_dict()
         )
+        # Prepare a list of (description_lower, item_code) tuples for similarity search.
+        # We keep duplicates because descriptions may map to multiple codes; weighting
+        # by total quantity will favour more frequently ordered codes during matching.
+        self._desc_code_pairs: List[tuple[str, str]] = [
+            (str(row["item_description"]).lower(), str(row["item_code"]))
+            for _, row in self.history.iterrows()
+        ]
+
+        # Build a set of known (customer_code, item_code) pairs to quickly identify
+        # whether a new order item exists in the history. Casting both parts to
+        # string ensures consistent comparisons when codes are numeric.
+        self.known_pairs = set(
+            zip(
+                self.history["customer_code"].astype(str),
+                self.history["item_code"].astype(str),
+            )
+        )
+
+    def _find_similar_code(self, description: str) -> Optional[str]:
+        """Find the best matching item_code for a given description using fuzzy similarity.
+
+        This fallback is used when no match is found via exact or fuzzy description mapping.
+        It computes a similarity ratio between the target description and every description
+        in the history. Scores are weighted by the total quantity ordered for each code
+        to bias the selection towards frequently purchased items. The code with the
+        highest weighted similarity score is returned. If no descriptions are present
+        in the history, ``None`` is returned.
+
+        Parameters
+        ----------
+        description: str
+            The item description from a new order for which we need to guess a code.
+
+        Returns
+        -------
+        Optional[str]
+            The most plausible item code based on description similarity, or ``None``
+            if the history is empty.
+        """
+        if not self._desc_code_pairs:
+            return None
+        from difflib import SequenceMatcher  # imported lazily to avoid overhead
+        target = str(description).lower().strip()
+        # Precompute the maximum total quantity to normalise weights.
+        max_qty = max(self.code_qty_totals.values()) if self.code_qty_totals else 1.0
+        best_code: Optional[str] = None
+        best_score: float = 0.0
+        # Iterate through all known description/code pairs. We do not deduplicate
+        # descriptions here because the quantity weight can differ per code even if
+        # descriptions are identical across different item codes.
+        for desc, code in self._desc_code_pairs:
+            if not desc:
+                continue
+            # Compute similarity ratio between descriptions. SequenceMatcher returns
+            # a float in [0, 1] representing the proportion of matching blocks.
+            sim = SequenceMatcher(None, target, desc).ratio()
+            # Weight by the relative quantity ordered for this code. This biases
+            # towards codes with larger historical order volumes.
+            qty_weight = self.code_qty_totals.get(code, 0.0) / max_qty
+            # Combine similarity and weight. A small epsilon ensures that even
+            # codes with zero quantity can be selected if no better match exists.
+            score = sim * (1.0 + qty_weight)
+            if score > best_score:
+                best_score = score
+                best_code = code
+        return best_code
 
     def match(self, orders_df: pd.DataFrame) -> pd.DataFrame:
         """Compare new orders against historical stats.
@@ -186,6 +254,21 @@ class OrderMatcher:
             if mapped_code:
                 df.at[idx, "item_code"] = mapped_code
                 df.at[idx, "desc_mapped"] = True
+
+        # Additional fallback: for any remaining unknown codes (i.e. None or 'None'),
+        # attempt to infer the most plausible code by computing similarity between
+        # the current description and all historical descriptions, weighted by the
+        # total quantity ordered for each candidate code. This ensures that even
+        # previously unseen descriptions are mapped to the closest available item.
+        for idx, row in df.iterrows():
+            code = row.get("item_code")
+            # Treat string 'None' or empty strings as missing codes
+            if not code or str(code).lower() in {"none", "nan", ""}:
+                desc = row.get("item_description")
+                best = self._find_similar_code(desc)
+                if best:
+                    df.at[idx, "item_code"] = best
+                    df.at[idx, "desc_mapped"] = True
         # Cast merge keys to string again in case mapping introduced new codes
         for k in ["customer_code", "item_code"]:
             if k in df.columns:
