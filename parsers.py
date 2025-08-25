@@ -253,22 +253,33 @@ def parse_pdf(uploaded_file) -> pd.DataFrame:
         ``customer_code`` column before matching.
     """
     # Read the PDF into a list of lines using pdfplumber or pdftotext
+    #
+    # The parsing strategy is:
+    #   1. Extract all text lines with columns preserved (using pdftotext -layout as a fallback).
+    #   2. Locate the start of the order table by scanning for a header line containing both
+    #      "item" and "qty" (case‑insensitive). Only lines after this header are considered
+    #      part of the order list.
+    #   3. Skip lines containing non‑product labels (e.g. "HSN Code", "Net Total", etc.).
+    #   4. For each remaining line that contains a quantity pattern (e.g. "4,00"), extract
+    #      the prefix before the quantity as the item description. If the first token of
+    #      the prefix contains digits, that token is interpreted as a vendor item code and
+    #      removed from the description. The quantity is parsed by replacing the comma
+    #      decimal separator with a dot and converting to float.
+    #   5. Compilation stops when a footer line (e.g. "Net Total" or "Grand Net Total") is reached.
+
     lines: List[str] = []
     # Determine whether uploaded_file is a streamlit UploadedFile or a path
     if hasattr(uploaded_file, "read"):
-        # We need to read the bytes into memory once. We'll keep a copy
-        # because pdfplumber and pdftotext both require a file path or bytes.
         data = uploaded_file.read()
         pdf_bytes = io.BytesIO(data)
         file_path: Optional[str] = None
     else:
         pdf_bytes = None
         file_path = str(uploaded_file)
+
     # Try using pdfplumber first if available
-    tried_plumber = False
     if pdfplumber is not None:
         try:
-            tried_plumber = True
             if pdf_bytes is not None:
                 pdf_obj = pdfplumber.open(io.BytesIO(data))
             else:
@@ -278,9 +289,9 @@ def parse_pdf(uploaded_file) -> pd.DataFrame:
                     text = page.extract_text() or ""
                     lines.extend(text.split("\n"))
         except Exception:
-            # Fall back to pdftotext
             lines = []
-    # If lines is still empty, try using pdftotext
+
+    # Fall back to pdftotext if pdfplumber is unavailable or produced no lines
     if not lines:
         try:
             import subprocess
@@ -292,51 +303,61 @@ def parse_pdf(uploaded_file) -> pd.DataFrame:
                     tmp_path = tmp.name
                 file_path = tmp_path
             # Use -layout to preserve columns
-            output = subprocess.check_output(["pdftotext", "-layout", file_path or "", "-"], text=True)
+            output = subprocess.check_output([
+                "pdftotext", "-layout", file_path or "", "-"
+            ], text=True)
             lines = output.split("\n")
         except Exception:
             raise RuntimeError(
                 "Impossibile estrarre testo dal PDF: assicurati che 'pdfplumber' o 'pdftotext' siano disponibili."
             )
+
     rows: List[Dict[str, Optional[str]]] = []
-    # Pattern to find the first decimal quantity with a comma
     qty_regex = re.compile(r"(\d+,\d+)")
+    capture = False
     for raw in lines:
-        line = raw.strip()
+        line = raw.rstrip()
         if not line:
             continue
-        # Skip common non‑item lines
-        lowered = line.lower()
-        if any(key in lowered for key in ["hsn code", "delivery date", "net total", "grand net total", "item no."]):
+        lower = line.lower()
+        # Detect the header that marks the start of the order table
+        if not capture:
+            if ("item" in lower and "qty" in lower) or ("vendor" in lower and "qty" in lower):
+                capture = True
+            continue
+        # Stop capturing when reaching totals or footer lines
+        if any(key in lower for key in ["net total", "grand net total", "delivery date"]):
+            break
+        # Skip classification or other non‑product lines
+        if "hsn code" in lower or "reference" in lower:
             continue
         m = qty_regex.search(line)
         if not m:
             continue
         qty_str = m.group(1)
-        # Everything before the quantity is considered the prefix
-        prefix = line[: m.start()].strip()
-        # Attempt to split the prefix into an item code and description. If the
-        # first token contains any digit it is treated as the code.
-        tokens = prefix.split()
+        # Extract the prefix (potential vendor code + description) before the quantity
+        prefix = line[:m.start()].rstrip()
+        # Collapse multiple spaces to a single space for easier tokenisation
+        collapsed = re.sub(r"\s{2,}", " ", prefix.strip())
+        tokens = collapsed.split() if collapsed else []
         code: Optional[str] = None
-        desc_tokens: List[str] = []
+        description: str = collapsed
         if tokens:
             first_tok = tokens[0]
+            # Treat the first token as a vendor code if it contains any digits
             if re.search(r"\d", first_tok):
                 code = first_tok
-                desc_tokens = tokens[1:]
+                description = " ".join(tokens[1:]).strip()
             else:
-                desc_tokens = tokens
-        description = " ".join(desc_tokens).strip()
+                description = collapsed
         # Convert quantity: replace comma decimal with dot; ignore thousands separators
         try:
             qty_val = float(qty_str.replace(".", "").replace(",", "."))
         except Exception:
             qty_val = None
-        row: Dict[str, Optional[str]] = {
+        rows.append({
             "item_code": code,
-            "item_description": description or prefix,  # fallback to prefix if no tokens
+            "item_description": description,
             "qty_ordered": qty_val,
-        }
-        rows.append(row)
+        })
     return pd.DataFrame(rows)
