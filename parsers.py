@@ -184,24 +184,56 @@ def parse_text(uploaded_file) -> pd.DataFrame:
         line = line.strip()
         if not line:
             continue
-        # Pattern: code description quantity
-        m = re.match(r"(\S+)\s+(.+?)\s+(\d+)(?:\s+|$)", line)
-        if m:
-            item_code, item_description, qty_ordered = m.groups()
-            rows.append({
-                "item_code": item_code.strip(),
-                "item_description": item_description.strip(),
-                "qty_ordered": int(qty_ordered),
-            })
+        # Split the line into tokens. We expect the last token to be the quantity.
+        tokens = line.split()
+        if not tokens:
+            continue
+        # Attempt to parse the last token as an integer quantity
+        qty_token = tokens[-1]
+        try:
+            qty_val = float(qty_token.replace(",", "."))
+        except ValueError:
+            # not a quantity; skip this line
+            continue
+        # Determine whether the first token is an item code. If it contains any digits,
+        # treat it as a code; otherwise assume no code is provided and the description
+        # encompasses all tokens except the last one.
+        first = tokens[0]
+        has_digit = bool(re.search(r"\d", first))
+        if has_digit and len(tokens) >= 3:
+            code = first
+            desc_tokens = tokens[1:-1]
+        else:
+            code = None
+            desc_tokens = tokens[:-1]
+        item_description = " ".join(desc_tokens).strip()
+        rows.append({
+            "item_code": code,
+            "item_description": item_description,
+            "qty_ordered": qty_val,
+        })
     return pd.DataFrame(rows)
 
 
 def parse_pdf(uploaded_file) -> pd.DataFrame:
     """Parse a PDF file into a DataFrame.
 
-    This function uses pdfplumber to extract text from each page and applies
-    a simple regular expression similar to the text parser. PDF layouts vary
-    widely, so you may need to customise the patterns to suit your suppliers.
+    This parser attempts to extract order lines from a variety of PDF
+    layouts. It uses ``pdfplumber`` to extract free‑form text from each
+    page, then applies heuristics and regular expressions to identify
+    product descriptions, quantities and prices. Many customer order
+    confirmations follow a pattern similar to:
+
+    ``
+    Item No. Vendor No. Item                             Qty Unit        Price    Total
+    12345    6789       SOME PRODUCT DESCRIPTION         4,00 Each        5,00    20,00
+    HSN Code 1234
+    ``
+
+    On other documents the ``Vendor No.`` column may be blank and a
+    separate ``HSN Code`` row appears below each item line. In such
+    cases only the description and quantity can be extracted and the
+    application will attempt to map the description to a known item.
 
     Parameters
     ----------
@@ -211,30 +243,68 @@ def parse_pdf(uploaded_file) -> pd.DataFrame:
     Returns
     -------
     pandas.DataFrame
-        DataFrame with canonical columns. Customer code must be
-        injected elsewhere as PDFs often do not include it on each row.
+        DataFrame with at most the columns ``item_code``,
+        ``item_description``, ``qty_ordered`` and optionally ``price``.
+        The caller is responsible for injecting a customer code before
+        further processing.
     """
     if pdfplumber is None:
         raise ImportError(
             "pdfplumber non è installato nell'ambiente. Impossibile analizzare i file PDF."
         )
     rows: List[Dict[str, Optional[str]]] = []
-    # pdfplumber requires a file-like object with a read method
+    # Prepare file‑like object for pdfplumber
     if hasattr(uploaded_file, "read"):
         pdf_reader = pdfplumber.open(io.BytesIO(uploaded_file.read()))
     else:
         pdf_reader = pdfplumber.open(uploaded_file)
+    # Regular expression for item lines. We allow an optional numeric
+    # vendor code at the start of the line. The description may
+    # contain any characters, followed by a quantity expressed as
+    # digits with a comma decimal separator (e.g. ``4,00``). After
+    # the quantity we skip over the unit text and capture price and
+    # total if present. ``HSN Code`` lines are ignored later.
+    item_pattern = re.compile(
+        r"^(?:(?P<item_code>\d+)\s+)?"
+        r"(?P<item_description>.+?)\s+"
+        r"(?P<qty>[\d]+,[\d]+)\s+"
+        r".*?"  # unit and other text
+        r"(?P<price>[\d]+,[\d]+)\s+"
+        r"(?P<total>[\d]+,[\d]+)"
+        r"$"
+    )
     with pdf_reader as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            for line in text.split("\n"):
-                line = line.strip()
-                m = re.match(r"(\S+)\s+(.+?)\s+(\d+)(?:\s+|$)", line)
-                if m:
-                    item_code, item_description, qty_ordered = m.groups()
-                    rows.append({
-                        "item_code": item_code.strip(),
-                        "item_description": item_description.strip(),
-                        "qty_ordered": int(qty_ordered),
-                    })
+            for raw_line in text.split("\n"):
+                line = raw_line.strip()
+                # Skip empty lines and HSN Code rows
+                if not line or line.lower().startswith("hsn code"):
+                    continue
+                m = item_pattern.match(line)
+                if not m:
+                    continue
+                groups = m.groupdict()
+                desc = groups.get("item_description", "").strip()
+                qty_str = groups.get("qty") or ""
+                price_str = groups.get("price") or ""
+                code = groups.get("item_code")
+                # Normalise decimal separators: replace thousands separators (.) and
+                # decimal comma with a dot for numeric conversion
+                def to_float(s: str) -> Optional[float]:
+                    try:
+                        return float(s.replace(".", "").replace(",", "."))
+                    except Exception:
+                        return None
+                qty_val = to_float(qty_str)
+                price_val = to_float(price_str)
+                row: Dict[str, Optional[str]] = {
+                    "item_code": code if code else None,
+                    "item_description": desc,
+                    "qty_ordered": qty_val,
+                }
+                # Optionally include price for downstream analytics
+                if price_val is not None:
+                    row["price"] = price_val
+                rows.append(row)
     return pd.DataFrame(rows)
