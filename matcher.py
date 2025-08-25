@@ -79,17 +79,19 @@ class OrderMatcher:
             .sum()
             .reset_index(name="qty_total")
         )
-        # Count occurrences of each (description, code) pair globally
-        code_counts = (
-            self.history.groupby(["item_description", "item_code"])  # type: ignore
-            .size()
-            .reset_index(name="count")
+        # Aggregate total quantity ordered for each (description, code) pair globally.
+        # We prefer codes with the highest total quantity over simple frequency
+        global_totals = (
+            self.history
+            .groupby(["item_description", "item_code"])["qty_ordered_num"]
+            .sum()
+            .reset_index(name="qty_total")
         )
-        for desc, group in code_counts.groupby("item_description"):
-            # pick the code with the highest occurrence for this description
-            most_common_row = group.loc[group["count"].idxmax()]
+        for desc, group in global_totals.groupby("item_description"):
+            # Select the code with the maximum total quantity ordered for this description
+            max_idx = group["qty_total"].idxmax()
+            code_str = str(group.loc[max_idx, "item_code"])
             desc_str = str(desc).lower()
-            code_str = str(most_common_row["item_code"])
             global_desc_to_code[desc_str] = code_str
         # Build per‑customer description mapping. For each customer we find the most
         # commonly purchased code for each description. If multiple codes share
