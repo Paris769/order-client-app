@@ -138,53 +138,97 @@ class OrderMatcher:
             )
         )
 
-    def _find_similar_code(self, description: str) -> Optional[str]:
-        """Find the best matching item_code for a given description using fuzzy similarity.
+    def _normalise(self, text: str) -> List[str]:
+        """Normalise a description into a list of lower‑case tokens.
 
-        This fallback is used when no match is found via exact or fuzzy description mapping.
-        It computes a similarity ratio between the target description and every description
-        in the history. Scores are weighted by the total quantity ordered for each code
-        to bias the selection towards frequently purchased items. The code with the
-        highest weighted similarity score is returned. If no descriptions are present
-        in the history, ``None`` is returned.
+        This helper removes punctuation and splits on whitespace. It is used
+        to compute Jaccard similarity between descriptions. Numbers and
+        very short tokens (length < 2) are ignored as they tend not to be
+        discriminative for product matching.
+
+        Parameters
+        ----------
+        text: str
+            The text to normalise.
+
+        Returns
+        -------
+        List[str]
+            A list of normalised tokens.
+        """
+        import re
+        # Remove punctuation by replacing non‑alphanumeric characters with space
+        cleaned = re.sub(r"[^\w]+", " ", str(text).lower())
+        tokens = [t for t in cleaned.split() if len(t) > 1 and not t.isdigit()]
+        return tokens
+
+    def _find_similar_code(self, description: str, used_codes: Optional[set[str]] = None) -> Optional[str]:
+        """Find the best matching item_code for a given description using token/Jaccard similarity.
+
+        When no match is found via the customer or global description mappings, this
+        fallback searches all historical descriptions and selects the code with
+        the highest Jaccard similarity (on normalised token sets) to the target
+        description. Similarity scores are weighted by the relative quantity
+        purchased for each code to prefer frequently ordered items. Codes
+        already used for other unknown items can be excluded by passing
+        ``used_codes``.
 
         Parameters
         ----------
         description: str
             The item description from a new order for which we need to guess a code.
+        used_codes: set[str], optional
+            A set of item codes that have already been assigned to other rows. If
+            provided, these codes will not be considered for matching.
 
         Returns
         -------
         Optional[str]
             The most plausible item code based on description similarity, or ``None``
-            if the history is empty.
+            if no suitable match exists.
         """
         if not self._desc_code_pairs:
             return None
-        from difflib import SequenceMatcher  # imported lazily to avoid overhead
-        target = str(description).lower().strip()
-        # Precompute the maximum total quantity to normalise weights.
+        target_tokens = set(self._normalise(description))
+        if not target_tokens:
+            return None
         max_qty = max(self.code_qty_totals.values()) if self.code_qty_totals else 1.0
         best_code: Optional[str] = None
         best_score: float = 0.0
-        # Iterate through all known description/code pairs. We do not deduplicate
-        # descriptions here because the quantity weight can differ per code even if
-        # descriptions are identical across different item codes.
+        used_codes = used_codes or set()
+        # Compute similarity for each historical description
         for desc, code in self._desc_code_pairs:
-            if not desc:
+            if code in used_codes:
                 continue
-            # Compute similarity ratio between descriptions. SequenceMatcher returns
-            # a float in [0, 1] representing the proportion of matching blocks.
-            sim = SequenceMatcher(None, target, desc).ratio()
-            # Weight by the relative quantity ordered for this code. This biases
-            # towards codes with larger historical order volumes.
+            desc_tokens = set(self._normalise(desc))
+            if not desc_tokens:
+                continue
+            # Jaccard similarity: intersection over union
+            inter = target_tokens & desc_tokens
+            if not inter:
+                continue  # skip completely disjoint descriptions
+            union = target_tokens | desc_tokens
+            jac = len(inter) / len(union)
+            if jac <= 0:
+                continue
             qty_weight = self.code_qty_totals.get(code, 0.0) / max_qty
-            # Combine similarity and weight. A small epsilon ensures that even
-            # codes with zero quantity can be selected if no better match exists.
-            score = sim * (1.0 + qty_weight)
+            score = jac * (1.0 + qty_weight)
             if score > best_score:
                 best_score = score
                 best_code = code
+        # If no candidate found using Jaccard, fall back to SequenceMatcher as a last resort
+        if best_code is None:
+            from difflib import SequenceMatcher
+            target = " ".join(target_tokens)
+            for desc, code in self._desc_code_pairs:
+                if code in used_codes:
+                    continue
+                sim = SequenceMatcher(None, target, desc).ratio()
+                qty_weight = self.code_qty_totals.get(code, 0.0) / max_qty
+                score = sim * (1.0 + qty_weight)
+                if score > best_score:
+                    best_score = score
+                    best_code = code
         return best_code
 
     def match(self, orders_df: pd.DataFrame) -> pd.DataFrame:
@@ -256,19 +300,21 @@ class OrderMatcher:
                 df.at[idx, "desc_mapped"] = True
 
         # Additional fallback: for any remaining unknown codes (i.e. None or 'None'),
-        # attempt to infer the most plausible code by computing similarity between
-        # the current description and all historical descriptions, weighted by the
-        # total quantity ordered for each candidate code. This ensures that even
-        # previously unseen descriptions are mapped to the closest available item.
+        # attempt to infer the most plausible code by computing token similarity between
+        # the current description and all historical descriptions. To avoid assigning
+        # the same code to multiple unknown items erroneously, maintain a set of
+        # codes already mapped in this phase and exclude them from consideration.
+        used_codes: set[str] = set()
         for idx, row in df.iterrows():
             code = row.get("item_code")
             # Treat string 'None' or empty strings as missing codes
             if not code or str(code).lower() in {"none", "nan", ""}:
                 desc = row.get("item_description")
-                best = self._find_similar_code(desc)
+                best = self._find_similar_code(desc, used_codes)
                 if best:
                     df.at[idx, "item_code"] = best
                     df.at[idx, "desc_mapped"] = True
+                    used_codes.add(best)
         # Cast merge keys to string again in case mapping introduced new codes
         for k in ["customer_code", "item_code"]:
             if k in df.columns:
