@@ -128,6 +128,28 @@ class OrderMatcher:
             for _, row in self.history.iterrows()
         ]
 
+        # Build a canonical description mapping for each item code.  For codes
+        # associated with multiple descriptions across the history, choose the
+        # description with the highest total quantity ordered as the canonical
+        # representation. This ensures that when we map a new row's item_code
+        # based on description we can also update its description to match the
+        # historical record. Without this mapping, newly matched rows could
+        # retain their original description (e.g. from a PDF) which may differ
+        # from the description stored in the sales history. Casting codes to
+        # strings ensures consistent lookup keys.
+        code_desc_totals = (
+            self.history.groupby(["item_code", "item_description"])  # type: ignore[list-item]
+            ["qty_ordered_num"]
+            .sum()
+            .reset_index(name="qty_total")
+        )
+        self.code_to_desc: Dict[str, str] = {}
+        for code, group in code_desc_totals.groupby("item_code"):
+            # Select the description with the maximum total ordered quantity
+            idx = group["qty_total"].idxmax()
+            desc = str(group.loc[idx, "item_description"])
+            self.code_to_desc[str(code)] = desc
+
         # Build a set of known (customer_code, item_code) pairs to quickly identify
         # whether a new order item exists in the history. Casting both parts to
         # string ensures consistent comparisons when codes are numeric.
@@ -296,8 +318,18 @@ class OrderMatcher:
                 if matches:
                     mapped_code = self.global_desc_to_code[matches[0]]
             if mapped_code:
+                # Assign the mapped code and mark that it came from a description-based match
                 df.at[idx, "item_code"] = mapped_code
                 df.at[idx, "desc_mapped"] = True
+                # Also update the description to the canonical one from the history if available.
+                # This ensures that the item_code always corresponds to the same
+                # description as defined in the sales data. Without this replacement,
+                # descriptions from incoming orders could override the canonical
+                # description, leading to mismatches (e.g. a vendor PDF might use
+                # a different wording for the same product).
+                canon_desc = self.code_to_desc.get(mapped_code)
+                if canon_desc is not None:
+                    df.at[idx, "item_description"] = canon_desc
 
         # Additional fallback: for any remaining unknown codes (i.e. None or 'None'),
         # attempt to infer the most plausible code by computing token similarity between
@@ -314,6 +346,10 @@ class OrderMatcher:
                 if best:
                     df.at[idx, "item_code"] = best
                     df.at[idx, "desc_mapped"] = True
+                    # Update description to canonical as for other description-based matches
+                    canon_desc = self.code_to_desc.get(best)
+                    if canon_desc is not None:
+                        df.at[idx, "item_description"] = canon_desc
                     used_codes.add(best)
         # Cast merge keys to string again in case mapping introduced new codes
         for k in ["customer_code", "item_code"]:
