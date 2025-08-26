@@ -128,6 +128,32 @@ class OrderMatcher:
             for _, row in self.history.iterrows()
         ]
 
+        # Build a mapping of codes purchased by each customer.  This will be used
+        # to restrict description-based matching to items that the customer has
+        # actually ordered before.  Without this restriction the matcher can
+        # incorrectly assign a new order to a product purchased by another
+        # customer simply because the description is vaguely similar.  Keys and
+        # codes are cast to strings to ensure consistent comparisons.
+        self.customer_codes: Dict[str, List[str]] = (
+            self.history.groupby("customer_code")
+            ["item_code"]
+            .apply(lambda series: [str(c) for c in series])
+            .to_dict()
+        )
+        # Compute total quantity ordered for each (customer_code, item_code) pair.
+        # This is used to weight description-similarity matches: codes with
+        # higher historical quantities are preferred.  Casting keys to strings
+        # ensures consistent lookup keys when codes are numeric.
+        cust_totals = (
+            self.history
+            .groupby(["customer_code", "item_code"])["qty_ordered_num"]
+            .sum()
+            .astype(float)
+        )
+        self.cust_code_qty_totals: Dict[tuple[str, str], float] = {}
+        for (cust, code), qty in cust_totals.items():
+            self.cust_code_qty_totals[(str(cust), str(code))] = qty
+
         # Build a canonical description mapping for each item code.  For codes
         # associated with multiple descriptions across the history, choose the
         # description with the highest total quantity ordered as the canonical
@@ -179,9 +205,18 @@ class OrderMatcher:
             A list of normalised tokens.
         """
         import re
-        # Remove punctuation by replacing non‑alphanumeric characters with space
+        # Replace non-word characters with spaces and split on 'x' to retain
+        # numerical dimensions (e.g. '50x60' -> '50 60').  We deliberately
+        # keep numeric tokens because dimensional differences (e.g. 72x110 vs
+        # 50x60) are important when matching products such as bags or sacs.
         cleaned = re.sub(r"[^\w]+", " ", str(text).lower())
-        tokens = [t for t in cleaned.split() if len(t) > 1 and not t.isdigit()]
+        cleaned = cleaned.replace("x", " ")  # separate dimension tokens
+        raw_tokens = cleaned.split()
+        # Keep tokens longer than 1 character.  Do not discard numeric tokens,
+        # but ignore very short or single-character tokens which tend not to be
+        # discriminative.  We do not filter out digits anymore because they
+        # convey important size information.
+        tokens = [t for t in raw_tokens if len(t) > 1]
         return tokens
 
     def _find_similar_code(self, description: str, used_codes: Optional[set[str]] = None) -> Optional[str]:
@@ -253,6 +288,105 @@ class OrderMatcher:
                     best_code = code
         return best_code
 
+    def _find_similar_code_for_customer(
+        self,
+        cust: str,
+        description: str,
+        used_codes: Optional[set[str]] = None,
+        threshold: float = 0.3,
+    ) -> Optional[str]:
+        """Find the most similar item_code for a given description based on a specific customer's history.
+
+        This method restricts matching to the set of item codes previously
+        purchased by the given customer.  Similarity is computed using
+        Jaccard similarity between token sets (including numeric tokens) and
+        weighted by the proportion of quantity ordered for each code.  Codes
+        that have been assigned to other rows can be excluded via ``used_codes``.
+        Only return a code if the best weighted similarity score exceeds
+        ``threshold``; otherwise return None to indicate that no suitable
+        match exists.
+
+        Parameters
+        ----------
+        cust: str
+            Customer code for which to find a matching item code.
+        description: str
+            The item description from a new order.
+        used_codes: set[str], optional
+            Codes to exclude from consideration (already used for other rows).
+        threshold: float, optional
+            Minimum weighted similarity score required to consider a match.
+
+        Returns
+        -------
+        Optional[str]
+            The best matching item code or None if no match exceeds the
+            threshold.
+        """
+        # Retrieve the list of codes this customer has ordered
+        codes = self.customer_codes.get(str(cust), [])
+        if not codes:
+            return None
+        used_codes = used_codes or set()
+        target_tokens = set(self._normalise(description))
+        if not target_tokens:
+            return None
+        # Determine maximum quantity ordered by this customer for normalisation
+        max_qty = 1.0
+        # Compute max per-customer qty
+        for code in codes:
+            qty = self.cust_code_qty_totals.get((str(cust), code), 0.0)
+            if qty > max_qty:
+                max_qty = qty
+        best_code: Optional[str] = None
+        best_score: float = 0.0
+        # Compute similarity for each candidate code
+        for code in codes:
+            if code in used_codes:
+                continue
+            canon_desc = self.code_to_desc.get(code)
+            if not canon_desc:
+                continue
+            desc_tokens = set(self._normalise(canon_desc))
+            if not desc_tokens:
+                continue
+            inter = target_tokens & desc_tokens
+            if not inter:
+                continue
+            union = target_tokens | desc_tokens
+            jac = len(inter) / len(union)
+            if jac <= 0:
+                continue
+            # Add a numeric similarity bonus: match numeric tokens (e.g. dimensions)
+            target_nums = [int(t) for t in target_tokens if t.isdigit()]
+            cand_nums = [int(t) for t in desc_tokens if t.isdigit()]
+            numeric_bonus = 0.0
+            if target_nums:
+                for tn in target_nums:
+                    if tn in cand_nums:
+                        numeric_bonus += 1.0
+                    else:
+                        # find nearest candidate number and award partial bonus if close (<=2 units)
+                        diffs = [abs(tn - cn) for cn in cand_nums] if cand_nums else []
+                        if diffs:
+                            min_diff = min(diffs)
+                            if min_diff <= 2:
+                                numeric_bonus += 0.5
+                numeric_score = numeric_bonus / len(target_nums)
+            else:
+                numeric_score = 0.0
+            # Combine Jaccard similarity with numeric similarity
+            combined_sim = jac + numeric_score
+            qty_weight = self.cust_code_qty_totals.get((str(cust), code), 0.0) / max_qty
+            score = combined_sim * (1.0 + qty_weight)
+            if score > best_score:
+                best_score = score
+                best_code = code
+        # Only accept a match if the score exceeds the threshold
+        if best_score >= threshold:
+            return best_code
+        return None
+
     def match(self, orders_df: pd.DataFrame) -> pd.DataFrame:
         """Compare new orders against historical stats.
 
@@ -286,8 +420,12 @@ class OrderMatcher:
         # find a known code based on the description. We prioritise mappings from
         # this customer's purchase history; if none exist we fall back to a global
         # description mapping. Exact matches are preferred over fuzzy matches.
+        # Track codes that have been assigned via description matching to avoid
+        # mapping multiple unknown items to the same code when using similarity.
+        used_codes_in_loop: set[str] = set()
         for idx, row in df.iterrows():
             cust = str(row.get("customer_code"))
+            # item_code may be None or 'nan'
             code = str(row.get("item_code")) if row.get("item_code") is not None else None
             # Skip if we already know this customer and code combination
             if code and (cust, code) in self.known_pairs:
@@ -299,54 +437,65 @@ class OrderMatcher:
             if key_cust_exact in self.cust_desc_to_code:
                 mapped_code = self.cust_desc_to_code[key_cust_exact]
             else:
-                # 2) Fuzzy match on customer‑specific descriptions
-                # Build candidate descriptions for this customer
+                # 2) Fuzzy match on customer‑specific descriptions using close_matches
                 cust_desc_keys = [k[1] for k in self.cust_desc_to_code.keys() if k[0] == cust]
                 if cust_desc_keys:
-                    matches = difflib.get_close_matches(desc_lower, cust_desc_keys, n=1, cutoff=0.7)
+                    # Use a high cutoff to avoid loosely matching descriptions (e.g. 50x60 vs 72x110)
+                    matches = difflib.get_close_matches(desc_lower, cust_desc_keys, n=1, cutoff=0.8)
                     if matches:
-                        # Map back to full key to retrieve code
                         matched_desc = matches[0]
                         mapped_code = self.cust_desc_to_code[(cust, matched_desc)]
+            # 2.5) Token/Jaccard-based match restricted to the customer's purchase history
+            if mapped_code is None:
+                best_for_cust = self._find_similar_code_for_customer(
+                    cust,
+                    row.get("item_description"),
+                    used_codes=used_codes_in_loop,
+                    threshold=0.4,
+                )
+                if best_for_cust:
+                    mapped_code = best_for_cust
             # 3) Fallback to global exact match
             if mapped_code is None and desc_lower in self.global_desc_to_code:
                 mapped_code = self.global_desc_to_code[desc_lower]
             # 4) Fallback to global fuzzy match
             if mapped_code is None:
                 global_keys = list(self.global_desc_to_code.keys())
-                matches = difflib.get_close_matches(desc_lower, global_keys, n=1, cutoff=0.8)
+                # Use a high cutoff to avoid loosely matching descriptions across all customers
+                matches = difflib.get_close_matches(desc_lower, global_keys, n=1, cutoff=0.9)
                 if matches:
                     mapped_code = self.global_desc_to_code[matches[0]]
             if mapped_code:
                 # Assign the mapped code and mark that it came from a description-based match
                 df.at[idx, "item_code"] = mapped_code
                 df.at[idx, "desc_mapped"] = True
+                # Record that this code was used to avoid duplicate assignment
+                used_codes_in_loop.add(mapped_code)
                 # Also update the description to the canonical one from the history if available.
-                # This ensures that the item_code always corresponds to the same
-                # description as defined in the sales data. Without this replacement,
-                # descriptions from incoming orders could override the canonical
-                # description, leading to mismatches (e.g. a vendor PDF might use
-                # a different wording for the same product).
                 canon_desc = self.code_to_desc.get(mapped_code)
                 if canon_desc is not None:
                     df.at[idx, "item_description"] = canon_desc
 
-        # Additional fallback: for any remaining unknown codes (i.e. None or 'None'),
-        # attempt to infer the most plausible code by computing token similarity between
-        # the current description and all historical descriptions. To avoid assigning
-        # the same code to multiple unknown items erroneously, maintain a set of
-        # codes already mapped in this phase and exclude them from consideration.
+        # Additional fallback: for any remaining unknown codes (i.e. None or blank),
+        # attempt to infer the most plausible code using per-customer similarity.
+        # If no suitable code is found for the customer (score below threshold), leave
+        # the code as missing (it will be flagged as UNKNOWN_ITEM).
         used_codes: set[str] = set()
         for idx, row in df.iterrows():
             code = row.get("item_code")
-            # Treat string 'None' or empty strings as missing codes
+            # Treat missing codes (None, NaN, empty string) as unknown
             if not code or str(code).lower() in {"none", "nan", ""}:
                 desc = row.get("item_description")
-                best = self._find_similar_code(desc, used_codes)
+                cust = str(row.get("customer_code"))
+                best = self._find_similar_code_for_customer(
+                    cust,
+                    desc,
+                    used_codes=used_codes,
+                    threshold=0.4,
+                )
                 if best:
                     df.at[idx, "item_code"] = best
                     df.at[idx, "desc_mapped"] = True
-                    # Update description to canonical as for other description-based matches
                     canon_desc = self.code_to_desc.get(best)
                     if canon_desc is not None:
                         df.at[idx, "item_description"] = canon_desc
