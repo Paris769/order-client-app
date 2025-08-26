@@ -1,44 +1,68 @@
 """
-Logic to compare new orders against historical data.
+Logic to compare new orders against historical data, with hierarchical matching and fallback.
+
+This module defines an ``OrderMatcher`` class that takes historical order data and
+matches new order lines against it.  It uses a hierarchy of matching strategies:
+
+1.  **Exact match** on the combination of customer code and item description.
+    If a customer has already purchased an item with the same description, that
+    item code is reused.
+
+2.  **Fuzzy match** on the customer’s past descriptions using ``difflib``.  This
+    catches minor typos or variations (e.g. missing accents, pluralisation).
+
+3.  **Token‑based similarity** using Jaccard on normalised tokens and a simple
+    numeric signature (dimensions such as ``10x20`` → ``[10, 20]``).  This stage
+    scores candidate item codes purchased by the same customer and selects the
+    best match above a configurable threshold.
+
+4.  **Fallback global match** across all historical items.  First an exact
+    match on description, then a fuzzy match, and finally a token‑based match
+    across all items.  This ensures that a plausible code is always suggested
+    even for completely new customers or descriptions.
+
+When a description match is used to assign an item code, the official
+historical description is substituted and a boolean flag ``desc_mapped`` is
+set.  Quantity anomalies are flagged via a z‑score comparison against the
+customer’s historical purchasing pattern; if no customer history is available
+for a given code, global statistics per description are used.
 """
 
 from __future__ import annotations
 
 import difflib
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np  # type: ignore
 import pandas as pd  # type: ignore
 
 
 class OrderMatcher:
-    """Compare new orders with historical quantity patterns."""
+    """Compare new orders with historical quantity patterns and assign item codes."""
 
     def __init__(self, history_df: pd.DataFrame, qty_zscore_threshold: float = 3.0) -> None:
         """
         Parameters
         ----------
         history_df: pandas.DataFrame
-            Historical orders with at least the columns ``customer_code``,
-            ``item_code``, ``item_description`` and ``qty_ordered``.
+            Historical orders with at least the columns ``customer_code``, ``item_code``,
+            ``item_description`` and ``qty_ordered``.
         qty_zscore_threshold: float, optional
-            Absolute z-score above which a quantity is considered anomalous.
+            Absolute z‑score above which a quantity is considered anomalous.
             Default is 3.0 (roughly 3 standard deviations).
         """
         # Make a copy of history and normalise key types
         self.history = history_df.copy()
-        self.qty_zscore_threshold = qty_zscore_threshold
+        for col in ["customer_code", "item_code"]:
+            if col in self.history.columns:
+                self.history[col] = self.history[col].astype(str)
 
-        # Ensure merge keys are consistently typed as strings (preservando NaN)
-        for k in ["customer_code", "item_code"]:
-            if k in self.history.columns:
-                self.history[k] = self.history[k].astype(str)
+        # Quantity numeric
+        self.history["qty_ordered_num"] = pd.to_numeric(
+            self.history.get("qty_ordered"), errors="coerce"
+        )
 
-        # qty numerica
-        qty_series = pd.to_numeric(self.history.get("qty_ordered"), errors="coerce")
-        self.history["qty_ordered_num"] = qty_series
-
-        # Stats per customer+item
+        # Stats per customer + item (mean and std)
         key = ["customer_code", "item_code"]
         grouped = (
             self.history.groupby(key)["qty_ordered_num"]
@@ -48,14 +72,14 @@ class OrderMatcher:
         )
         self.stats = grouped
 
-        # Stats per descrizione (fallback)
+        # Stats per description (fallback when no customer stats exist)
         desc_grouped = (
             self.history.groupby("item_description")["qty_ordered_num"]
             .agg(["mean", "std"])
             .dropna(subset=["mean", "std"])
             .reset_index()
         )
-        # Dizionario {"desc_lower": {"mean":..., "std":...}}
+        # Map normalised description → {"mean": float, "std": float}
         self.desc_stats: Dict[str, Dict[str, float]] = {}
         for _, row in desc_grouped.iterrows():
             self.desc_stats[str(row["item_description"]).lower()] = {
@@ -63,101 +87,135 @@ class OrderMatcher:
                 "std": float(row["std"]),
             }
 
-        # Descrizione canonica per codice (la più frequente)
-        code_desc_counts = (
-            self.history.groupby(["item_code", "item_description"])["qty_ordered_num"]
-            .count()
-            .reset_index(name="cnt")
-        )
+        # Canonical description per code: pick the most frequent description for each item code
+        # Determine a canonical description per item_code: choose the most frequent
         code_to_desc: Dict[str, str] = {}
-        for code, grp in code_desc_counts.groupby("item_code"):
-            idx = grp["cnt"].idxmax()
-            code_to_desc[str(code)] = str(code_desc_counts.loc[idx, "item_description"])
+        for code, hgrp in self.history.groupby("item_code"):
+            # count occurrences of each description for this code
+            counts = hgrp["item_description"].value_counts()
+            # pick the description with the highest count (idxmax returns the index label)
+            canonical_desc = str(counts.idxmax()) if not counts.empty else ""
+            code_to_desc[str(code)] = canonical_desc
         self.code_to_desc = code_to_desc
 
-        # Mapping globale: per descrizione → codice con quantità totale massima
-        global_totals = (
-            self.history.groupby(["item_description", "item_code"])["qty_ordered_num"]
+        # Quantity totals per item_code (used to weight similarity)
+        qty_totals = (
+            self.history.groupby("item_code")["qty_ordered_num"].sum().reset_index(name="qty_total")
+        )
+        self.code_qty_totals: Dict[str, float] = {
+            str(row["item_code"]): float(row["qty_total"])
+            for _, row in qty_totals.iterrows()
+        }
+        # Avoid zero max
+        max_total = max(self.code_qty_totals.values()) if self.code_qty_totals else 1.0
+        if max_total <= 0:
+            max_total = 1.0
+        self._max_total_qty = max_total
+
+        # Global description → predominant code (by quantity)
+        # Compute total quantities per (description, code)
+        desc_code_totals = (
+            self.history
+            .groupby(["item_description", "item_code"])["qty_ordered_num"]
             .sum()
             .reset_index(name="qty_total")
         )
         global_desc_to_code: Dict[str, str] = {}
-        for desc, grp in global_totals.groupby("item_description"):
-            max_idx = grp["qty_total"].idxmax()
-            global_desc_to_code[str(desc).lower()] = str(grp.loc[max_idx, "item_code"])
+        for desc, grp in desc_code_totals.groupby("item_description"):
+            # find the code with the highest total quantity for this description
+            idx_max = grp["qty_total"].idxmax()
+            row = grp.loc[idx_max]
+            global_desc_to_code[str(desc).lower()] = str(row["item_code"])
+        self.global_desc_to_code = global_desc_to_code
 
-        # Mapping per cliente: (customer, descr_lower) → codice con qty_total massima
-        qty_totals = (
+        # Per‑customer mapping (customer, description) → predominant code
+        qty_totals_cust = (
             self.history.groupby(["customer_code", "item_code"])["qty_ordered_num"]
             .sum()
             .reset_index(name="qty_total")
         )
         hist_with_totals = pd.merge(
-            self.history, qty_totals, on=["customer_code", "item_code"], how="left"
+            self.history,
+            qty_totals_cust,
+            on=["customer_code", "item_code"],
+            how="left",
         )
         cust_desc_to_code: Dict[Tuple[str, str], str] = {}
         for (cust, desc), grp in hist_with_totals.groupby(["customer_code", "item_description"]):
+            # pick the item_code with highest qty_total for this customer/description
             idx_max = grp["qty_total"].idxmax()
-            cust_desc_to_code[(str(cust), str(desc).lower())] = str(grp.loc[idx_max, "item_code"])
-
-        self.global_desc_to_code = global_desc_to_code
+            cust_desc_to_code[(str(cust), str(desc).lower())] = str(
+                hist_with_totals.loc[idx_max, "item_code"]
+            )
         self.cust_desc_to_code = cust_desc_to_code
 
-        # Quantità totali per codice (peso per similarità)
-        self.code_qty_totals: Dict[str, float] = (
-            self.history.groupby("item_code")["qty_ordered_num"].sum().astype(float).to_dict()
-        )
-
-        # Elenco (desc_lower, code) per eventuali strategie globali
-        self._desc_code_pairs: List[Tuple[str, str]] = [
-            (str(r["item_description"]).lower(), str(r["item_code"]))
-            for _, r in self.history.iterrows()
-        ]
-
-        # Codici acquistati per cliente (per restringere il dominio nel matching cliente)
+        # Reverse mapping: customer → set of codes purchased (used to restrict search domain)
         self.customer_codes: Dict[str, List[str]] = (
             self.history.groupby("customer_code")["item_code"]
             .apply(lambda s: [str(c) for c in s])
             .to_dict()
         )
 
-        # Dizionario rapido code -> desc canonica (se non già costruito)
-        # (già self.code_to_desc)
-        # fine __init__
+        # Prepare a list of (lowercase description, code) pairs for global token‑based similarity
+        self.desc_code_pairs: List[Tuple[str, str]] = [
+            (str(r["item_description"]).lower(), str(r["item_code"]))
+            for _, r in self.history.iterrows()
+        ]
 
-    # ---------------------------- utilità di similarità ----------------------------
+        # Threshold for anomaly detection
+        self.qty_zscore_threshold = float(qty_zscore_threshold)
+
+    # ----------------------------------------------------------------------
+    # Normalisation utilities
 
     @staticmethod
     def _normalise(text: str) -> List[str]:
-        """
-        Normalizza la descrizione in token:
-        - minuscole
-        - mantiene numeri
-        - spezza pattern '72x110' in ['72','110']
-        - rimuove punteggiatura
+        """Normalise a description into a list of tokens.
+
+        Lowercase, keep numbers, split on punctuation and treat dimension
+        patterns like ``50x60`` as separate numbers.
         """
         s = str(text).lower()
-        # separa 'x' con spazi
-        s = s.replace("×", "x").replace(" x ", " x ")
-        for ch in [",", ";", "(", ")", "[", "]", "{", "}", ":", ".", "/", "\\", "-", "_", "+", "'", '"']:
+        # separate 'x' (dimensions) by spaces to split numbers
+        s = s.replace("x", " x ").replace(" × ", " x ")
+        for ch in [
+            ",",
+            ".",
+            "?",
+            "!",
+            "(",
+            ")",
+            "[",
+            "]",
+            "{",
+            "}",
+            "/",
+            "\\",
+            "-",
+            "_",
+            "=",
+            "+",
+            "*",
+            "\"",
+        ]:
             s = s.replace(ch, " ")
         tokens: List[str] = []
         for tok in s.split():
+            # if 'x' inside token, split by 'x'
             if "x" in tok:
                 parts = [p for p in tok.split("x") if p]
                 tokens.extend(parts)
             else:
                 tokens.append(tok)
-        # rimuove token troppo corti (eccetto numeri)
-        out: List[str] = []
-        for t in tokens:
-            if len(t) > 1 or t.isdigit():
-                out.append(t)
-        return out
+        return tokens
 
     @staticmethod
-    def _numeric_signature(tokens: List[str]) -> List[int]:
-        """estrae tutti i numeri interi dai token, ordinati (per confronto di dimensioni)"""
+    def _numeric_signature(tokens: Iterable[str]) -> List[int]:
+        """Extract numeric dimensions from tokens.
+
+        Returns a sorted list of integers found in tokens.  Non‑numeric tokens
+        are ignored.
+        """
         nums: List[int] = []
         for t in tokens:
             if t.isdigit():
@@ -168,9 +226,12 @@ class OrderMatcher:
         return sorted(nums)
 
     def _score_similarity(self, a: str, b: str) -> float:
-        """
-        Combina Jaccard token + vicinanza numerica (dimensioni).
-        Ritorna uno score in [0,1].
+        """Compute a similarity score in [0, 1] between two descriptions.
+
+        Combines Jaccard similarity on normalised tokens with a numeric
+        signature similarity (for dimensions).  A simple heuristic is used:
+        Jaccard on token sets plus 0.5 times a dimension similarity
+        (comparing numeric lists element‑wise).
         """
         ta = self._normalise(a)
         tb = self._normalise(b)
@@ -179,22 +240,25 @@ class OrderMatcher:
         union = sa | sb
         jacc = len(inter) / len(union) if union else 0.0
 
-        na, nb = self._numeric_signature(ta), self._numeric_signature(tb)
+        na = self._numeric_signature(ta)
+        nb = self._numeric_signature(tb)
         if not na or not nb:
             num_sim = 0.0
         else:
-            # allinea per lunghezza
             m = min(len(na), len(nb))
             if m == 0:
                 num_sim = 0.0
             else:
-                diffs = [abs(na[i] - nb[i]) for i in range(m)]
-                max_base = max([max(na), max(nb), 1])
-                num_sim = max(0.0, 1.0 - (sum(diffs) / (m * max_base)))
-        # pesi: 0.7 jaccard, 0.3 numerico
-        return 0.7 * jacc + 0.3 * num_sim
+                # align lists by truncating longer one
+                num_sim = 1.0 - (sum(abs(na[i] - nb[i]) for i in range(m)) / sum(max(na[i], nb[i]) for i in range(m)))
+                num_sim = max(0.0, num_sim)
+        # combine: weight numeric similarity half as much as Jaccard overlap
+        score = jacc + 0.5 * num_sim
+        # clip to [0, 1]
+        return max(0.0, min(1.0, score))
 
-    # ---------------------------- finder per cliente / globale ----------------------------
+    # ----------------------------------------------------------------------
+    # Finder utilities (customer and global)
 
     def _find_similar_code_for_customer(
         self,
@@ -203,9 +267,11 @@ class OrderMatcher:
         used_codes: Optional[set[str]] = None,
         threshold: float = 0.25,
     ) -> Optional[str]:
-        """
-        Cerca il codice più simile tra quelli già acquistati dal cliente.
-        Usa punteggio di similarità e peso per quantità totale acquistata.
+        """Return the best matching item code for a customer using token similarity.
+
+        Only item codes already purchased by the customer are considered.
+        A weighting based on total quantity emphasises frequently ordered
+        items.  If no candidate exceeds the threshold, ``None`` is returned.
         """
         candidates = set(self.customer_codes.get(str(cust), []))
         if used_codes:
@@ -216,18 +282,18 @@ class OrderMatcher:
         desc_lower = str(description or "").lower()
         best_code = None
         best_score = 0.0
-
         for code in candidates:
             canon_desc = self.code_to_desc.get(code, "")
             sim = self._score_similarity(desc_lower, canon_desc.lower())
-            # pesatura per importanza del codice
-            weight = 1.0 + (self.code_qty_totals.get(code, 0.0) / max(1.0, max(self.code_qty_totals.values(), default=1.0)))
+            # weight by total quantity (avoid zero division)
+            qty = self.code_qty_totals.get(code, 0.0)
+            weight = 1.0 + qty / self._max_total_qty
             score = sim * weight
             if score > best_score:
                 best_score = score
                 best_code = code
-
-        if best_code and best_score >= threshold:
+        # return only if above threshold
+        if best_code and best_score > threshold:
             return best_code
         return None
 
@@ -237,179 +303,206 @@ class OrderMatcher:
         used_codes: Optional[set[str]] = None,
         threshold: float = 0.30,
     ) -> Optional[str]:
-        """
-        Fallback globale: cerca il codice più plausibile su tutto lo storico.
+        """Global fallback: search all item codes by token similarity.
+
+        A weighting based on total quantity emphasises popular items.  If no
+        candidate exceeds the threshold, ``None`` is returned.
         """
         desc_lower = str(description or "").lower()
         best_code = None
         best_score = 0.0
-        for desc, code in self._desc_code_pairs:
+        for desc, code in self.desc_code_pairs:
             if used_codes and code in used_codes:
                 continue
             sim = self._score_similarity(desc_lower, desc)
-            weight = 1.0 + (self.code_qty_totals.get(code, 0.0) / max(1.0, max(self.code_qty_totals.values(), default=1.0)))
+            qty = self.code_qty_totals.get(code, 0.0)
+            weight = 1.0 + qty / self._max_total_qty
             score = sim * weight
             if score > best_score:
                 best_score = score
                 best_code = code
-        if best_code and best_score >= threshold:
+        if best_code and best_score > threshold:
             return best_code
         return None
 
-    # ---------------------------- matching principale ----------------------------
+    # ----------------------------------------------------------------------
+    # Main matching routine
 
     def match(self, orders_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Ritorna un DataFrame con colonne aggiuntive:
-          - qty_mean, qty_std, qty_zscore
-          - flags (UNKNOWN_ITEM, DESC_MATCH, QTY_ANOM)
-          - desc_mapped (bool)
+        """Assign item codes and anomaly flags to a new orders DataFrame.
+
+        Returns a DataFrame with additional columns:
+
+        - ``qty_mean``, ``qty_std``, ``qty_zscore``: statistics for the matched
+          item/customer combination (or description fallback).
+        - ``flags``: comma‑separated string of flags:
+            - ``UNKNOWN_ITEM`` if the item could not be mapped at all.
+            - ``DESC_MATCH`` if the item code was inferred from the description (rather than provided).
+            - ``QTY_ANOM`` if the quantity deviates from the historical pattern beyond the z‑score threshold.
+        - ``desc_mapped``: bool indicating whether the description was replaced by the canonical one.
         """
         df = orders_df.copy()
+        # normalise key columns to string
+        for col in ["customer_code", "item_code"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
 
-        # Traccia se il codice è stato mappato da descrizione
+        # First pass: map unknown or missing item codes using description
+        used_codes_in_pass: set[str] = set()
+        # keep track of which rows used description mapping
         df["desc_mapped"] = False
-
-        # Cast chiavi a stringa
-        for k in ["customer_code", "item_code"]:
-            if k in df.columns:
-                df[k] = df[k].astype(str)
-
-        # -------------- Primo pass: prova a mappare i codici sconosciuti --------------
-
-        used_codes_in_loop: set[str] = set()
 
         for idx, row in df.iterrows():
             cust = str(row.get("customer_code"))
-            code = str(row.get("item_code")) if row.get("item_code") not in [None, "None", "nan", "NaN"] else None
-            if code and (cust, code) in set(zip(self.history["customer_code"], self.history["item_code"])):
-                # già visto in storico
+            code = str(row.get("item_code")) if row.get("item_code") not in [None, "None", "nan", "NaN", ""] else None
+            desc = str(row.get("item_description") or "")
+            # If code exists in history, skip
+            if code and (code, cust) in zip(self.history["item_code"], self.history["customer_code"]):
                 continue
 
-            desc_lower = str(row.get("item_description") or "").lower()
+            desc_lower = desc.lower()
             mapped_code: Optional[str] = None
 
-            # 1) exact match cliente su descrizione
+            # (1) exact per‑customer match on description
             key_cust_exact = (cust, desc_lower)
             if key_cust_exact in self.cust_desc_to_code:
                 mapped_code = self.cust_desc_to_code[key_cust_exact]
             else:
-                # 2) fuzzy cliente (difflib) cutoff alto
-                cust_desc_keys = [k[1] for k in self.cust_desc_to_code.keys() if k[0] == cust]
+                # (2) fuzzy per‑customer match with difflib
+                cust_desc_keys = [k for k in self.cust_desc_to_code.keys() if k[0] == cust]
                 if cust_desc_keys:
-                    matches = difflib.get_close_matches(desc_lower, cust_desc_keys, n=1, cutoff=0.8)
+                    matches = difflib.get_close_matches(
+                        desc_lower,
+                        [k[1] for k in cust_desc_keys],
+                        n=1,
+                        cutoff=0.8,
+                    )
                     if matches:
                         mapped_code = self.cust_desc_to_code[(cust, matches[0])]
-
-                # 2.5) token/numbers cliente (Jaccard+numeri)
+                # (3) token/numeric similarity per customer
                 if mapped_code is None:
-                    best_for_cust = self._find_similar_code_for_customer(
+                    mapped_code = self._find_similar_code_for_customer(
                         cust=cust,
                         description=desc_lower,
-                        used_codes=used_codes_in_loop,
-                        threshold=0.25,  # più permissiva per il cliente
+                        used_codes=used_codes_in_pass,
+                        threshold=0.25,
                     )
-                    if best_for_cust:
-                        mapped_code = best_for_cust
-
-            # 3) exact globale su descrizione
+            # (4) exact global match on description
             if mapped_code is None and desc_lower in self.global_desc_to_code:
                 mapped_code = self.global_desc_to_code[desc_lower]
-
-            # 4) fuzzy globale (difflib) cutoff molto alto
+            # (5) fuzzy global match
             if mapped_code is None:
                 global_keys = list(self.global_desc_to_code.keys())
-                matches = difflib.get_close_matches(desc_lower, global_keys, n=1, cutoff=0.9)
+                matches = difflib.get_close_matches(
+                    desc_lower,
+                    global_keys,
+                    n=1,
+                    cutoff=0.9,
+                )
                 if matches:
                     mapped_code = self.global_desc_to_code[matches[0]]
+            # (6) token/numeric global similarity
+            if mapped_code is None:
+                mapped_code = self._find_similar_code(
+                    description=desc_lower,
+                    used_codes=used_codes_in_pass,
+                    threshold=0.30,
+                )
+            # At this point, mapped_code may still be None; if so, try again without threshold
+            if mapped_code is None:
+                mapped_code = self._find_similar_code(
+                    description=desc_lower,
+                    used_codes=used_codes_in_pass,
+                    threshold=0.0,
+                )
 
-            # applica mappatura
+            # apply mapping if found
             if mapped_code:
                 df.at[idx, "item_code"] = mapped_code
                 df.at[idx, "desc_mapped"] = True
-                used_codes_in_loop.add(mapped_code)
-                # aggiorna descrizione con quella canonica di storico
+                used_codes_in_pass.add(mapped_code)
+                # replace description with canonical description
                 canon_desc = self.code_to_desc.get(mapped_code)
-                if canon_desc is not None:
+                if canon_desc:
                     df.at[idx, "item_description"] = canon_desc
 
-        # -------------- Secondo pass: fallback finale per i None rimasti --------------
-
-        used_codes: set[str] = set()
+        # Second pass: ensure any remaining missing codes are filled with a plausible suggestion
+        used_codes_overall: set[str] = set()
         for idx, row in df.iterrows():
             code = row.get("item_code")
-            if not code or str(code).lower() in {"none", "nan", ""}:
-                desc = row.get("item_description")
+            if not code or code in ["None", "nan", "NaN", ""]:
                 cust = str(row.get("customer_code"))
-
+                desc = str(row.get("item_description") or "")
                 best = self._find_similar_code_for_customer(
                     cust=cust,
-                    description=desc,
-                    used_codes=used_codes,
+                    description=desc.lower(),
+                    used_codes=used_codes_overall,
                     threshold=0.25,
                 )
                 if not best:
                     best = self._find_similar_code(
-                        description=desc,
-                        used_codes=used_codes,
+                        description=desc.lower(),
+                        used_codes=used_codes_overall,
                         threshold=0.30,
                     )
-
+                if not best:
+                    # no threshold: always suggest a code
+                    best = self._find_similar_code(
+                        description=desc.lower(),
+                        used_codes=used_codes_overall,
+                        threshold=0.0,
+                    )
                 if best:
                     df.at[idx, "item_code"] = best
+                    used_codes_overall.add(best)
                     df.at[idx, "desc_mapped"] = True
                     canon_desc = self.code_to_desc.get(best)
-                    if canon_desc is not None:
+                    if canon_desc:
                         df.at[idx, "item_description"] = canon_desc
-                    used_codes.add(best)
 
-        # Cast di sicurezza
-        for k in ["customer_code", "item_code"]:
-            if k in df.columns:
-                df[k] = df[k].astype(str)
+        # Cast keys to string again (safety)
+        for col in ["customer_code", "item_code"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str)
 
-        # qty numerica
+        # Quantity numeric conversion
         if "qty_ordered" in df.columns:
             df["qty_ordered"] = pd.to_numeric(df["qty_ordered"], errors="coerce")
 
-        # Join con stats
+        # Join with stats (mean and std) on customer_code and item_code
         key = ["customer_code", "item_code"]
         merged = pd.merge(df, self.stats, on=key, how="left")
-
-        # Riempi con stats per descrizione quando mancano quelle per codice
         merged["desc_used"] = False
-        na_idx = merged["qty_mean"].isna()
-        for j in merged[na_idx].index:
-            d = str(merged.at[j, "item_description"]).lower()
-            s = self.desc_stats.get(d)
-            if s:
-                merged.at[j, "qty_mean"] = s["mean"]
-                merged.at[j, "qty_std"] = s["std"]
-                merged.at[j, "desc_used"] = True
 
-        # calcolo z-score (attenzione a std=0 / NaN)
+        # Fill missing stats using description when available
+        for i, row in merged.iterrows():
+            if pd.isna(row["qty_mean"]):
+                d = str(row["item_description"]).lower()
+                s = self.desc_stats.get(d)
+                if s:
+                    merged.at[i, "qty_mean"] = s["mean"]
+                    merged.at[i, "qty_std"] = s["std"]
+                    merged.at[i, "desc_used"] = True
+
+        # Compute z‑score; beware division by zero / NaN
         merged["qty_zscore"] = (merged["qty_ordered"] - merged["qty_mean"]) / merged["qty_std"]
 
-        # ----------------------- flags -----------------------
-        def flag_row(row) -> str:
+        # Flag rows
+        def flag_row(row: pd.Series) -> str:
             flags: List[str] = []
-
-            # sconosciuto: nessuna stat e nessuna mappatura descrizione
+            # unknown if no stats and no description mapping occurred
             if pd.isna(row["qty_mean"]) and not row.get("desc_used") and not row.get("desc_mapped"):
                 flags.append("UNKNOWN_ITEM")
             else:
-                # se mappato da descrizione o usate stats descrizione
+                # description mapping used
                 if row.get("desc_used") or row.get("desc_mapped"):
                     flags.append("DESC_MATCH")
-
-                # evita div/0: std potrebbe essere 0
                 z = row.get("qty_zscore")
                 if pd.isna(z):
                     pass
                 else:
                     if not np.isfinite(z) or abs(z) > self.qty_zscore_threshold:
                         flags.append("QTY_ANOM")
-
             return ", ".join(flags)
 
         merged["flags"] = merged.apply(flag_row, axis=1)
