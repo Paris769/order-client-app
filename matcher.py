@@ -249,7 +249,16 @@ class OrderMatcher:
         target_tokens = set(self._normalise(description))
         if not target_tokens:
             return None
-        max_qty = max(self.code_qty_totals.values()) if self.code_qty_totals else 1.0
+        # Determine the maximum total quantity ordered across all codes.  This is
+        # used to normalise quantity weights when ranking similar descriptions.
+        # If the dictionary is empty or the maximum value is zero (i.e. no
+        # quantities recorded), fall back to 1.0 to avoid division by zero.
+        if self.code_qty_totals:
+            max_qty = max(self.code_qty_totals.values())
+            if max_qty == 0:
+                max_qty = 1.0
+        else:
+            max_qty = 1.0
         best_code: Optional[str] = None
         best_score: float = 0.0
         used_codes = used_codes or set()
