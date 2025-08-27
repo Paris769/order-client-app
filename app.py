@@ -89,6 +89,17 @@ def main() -> None:
     # Instantiate matcher
     matcher = OrderMatcher(hist_df)
 
+        # Slider per coefficiente di similitudine descrizione
+    sim_threshold = st.sidebar.slider(
+        "Coefficiente di similitudine descrizione",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.30,
+        step=0.05,
+        help="Modifica questa soglia per affinare il matching sulla descrizione"
+    )
+    cust_threshold = sim_threshold * 0.8
+
     # Collect and parse all new orders from uploaded files and manual text
     parsed_orders: List[pd.DataFrame] = []
     # Parse uploaded files if any
@@ -146,9 +157,9 @@ def main() -> None:
     st.dataframe(new_df)
 
     # Match against history
-    result_df = matcher.match(new_df)
+  #.match(, cust_desc_threshold=cust_threshold, global_desc_threshold=sim_thresholdnew_df)
     st.subheader("Risultati dell'analisi")
-    st.dataframe(result_df)
+      result_df = matcher.match(new_df, cust_desc_threshold=cust_threshold, global_desc_threshold=sim_threshold)
     # Show flagged rows
     flagged = result_df[result_df["flags"] != ""]
     if not flagged.empty:
