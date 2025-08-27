@@ -243,11 +243,29 @@ class OrderMatcher:
         sa, sb = set(ta), set(tb)
         inter = sa & sb
         union = sa | sb
+        # Compute Jaccard on all tokens as before
         jacc = len(inter) / len(union) if union else 0.0
+
+        # If there are no alphabetical tokens in common, penalise the score.
+        # This avoids matching descriptions that only share numbers (e.g. "300") but are otherwise unrelated.
+        # Determine tokens containing at least one alphabetic character.
+        alpha_a = {t for t in sa if any(c.isalpha() for c in t)}
+        alpha_b = {t for t in sb if any(c.isalpha() for c in t)}
+        if alpha_a and alpha_b and not (alpha_a & alpha_b):
+            # Reset Jaccard and numeric similarity to zero if no alphabetic overlap.
+            # Without any shared words, matching purely on numbers (e.g. "300") can lead to spurious
+            # matches such as equating a rotolo pellicola to a mocho simply because both contain "300".
+            jacc = 0.0
+            # Flag to zero out numeric similarity later
+            no_alpha_overlap = True
+        else:
+            no_alpha_overlap = False
 
         na = self._numeric_signature(ta)
         nb = self._numeric_signature(tb)
-        if not na or not nb:
+        if not na or not nb or no_alpha_overlap:
+            # Either no numeric signature or intentionally disable numeric similarity when there
+            # is no alphabetical token overlap.
             num_sim = 0.0
         else:
             m = min(len(na), len(nb))
@@ -290,9 +308,10 @@ class OrderMatcher:
         for code in candidates:
             canon_desc = self.code_to_desc.get(code, "")
             sim = self._score_similarity(desc_lower, canon_desc.lower())
-            # weight by total quantity (avoid zero division)
+            # weight by total quantity (avoid zero division).  Use a square root to reduce the influence of very
+            # popular items so that similarity drives the match more than sales volume.
             qty = self.code_qty_totals.get(code, 0.0)
-            weight = 1.0 + qty / self._max_total_qty
+            weight = 1.0 + (qty / self._max_total_qty) ** 0.5
             score = sim * weight
             if score > best_score:
                 best_score = score
@@ -321,7 +340,8 @@ class OrderMatcher:
                 continue
             sim = self._score_similarity(desc_lower, desc)
             qty = self.code_qty_totals.get(code, 0.0)
-            weight = 1.0 + qty / self._max_total_qty
+            # As above, dampen the weighting effect of very large quantities to prioritise descriptive similarity.
+            weight = 1.0 + (qty / self._max_total_qty) ** 0.5
             score = sim * weight
             if score > best_score:
                 best_score = score
