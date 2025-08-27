@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
@@ -196,6 +196,55 @@ def main() -> None:
     if not flagged.empty:
         st.subheader("Righe con avvisi o segnalate dall'utente")
         st.dataframe(flagged)
+
+        # Offer the user a choice to correct each flagged row.  For usability,
+        # propose only codes whose descriptions are similar to the flagged
+        # description, rather than all codes purchased by the customer.
+        st.markdown("**Seleziona il codice corretto per le righe segnalate:**")
+        # Iterate over flagged rows and build a selectbox for each one.
+        for idx, row in flagged.iterrows():
+            cust = str(row['customer_code'])
+            desc = str(row['item_description'])
+            # Gather candidate codes from the customer's purchase history
+            candidate_codes = list(matcher.customer_codes.get(cust, []))
+            options: List[Tuple[float, str, str]] = []
+            # Compute similarity for each candidate; use the matcher's private
+            # method to score similarity.
+            for code in candidate_codes:
+                canon_desc = matcher.code_to_desc.get(code, "")
+                sim = matcher._score_similarity(desc.lower(), canon_desc.lower())
+                options.append((sim, code, canon_desc))
+            # Filter out candidates with very low similarity and sort descending
+            options = [t for t in options if t[0] > 0.1]
+            options_sorted = sorted(options, key=lambda x: -x[0])[:5] if options else []
+            # If no candidate meets the threshold, fall back to top 5 by similarity across all codes
+            if not options_sorted:
+                # Compute similarity across all codes in the history
+                all_options: List[Tuple[float, str, str]] = []
+                for code2, canon_desc2 in matcher.code_to_desc.items():
+                    sim2 = matcher._score_similarity(desc.lower(), canon_desc2.lower())
+                    all_options.append((sim2, code2, canon_desc2))
+                options_sorted = sorted(all_options, key=lambda x: -x[0])[:5]
+            # Build display labels for the selectbox
+            select_options = [f"{code} – {canon_desc}" for _, code, canon_desc in options_sorted]
+            # Default index 0 if available
+            default_index = 0
+            chosen_label = st.selectbox(
+                f"Codice corretto per '{desc}'", select_options, index=default_index, key=f"correct_{idx}"
+            )
+            # Extract the selected code (string before the dash)
+            selected_code = chosen_label.split(" – ")[0] if " – " in chosen_label else chosen_label
+            # Update the result data frame with the user‑selected code
+            result_df.at[idx, 'item_code'] = selected_code
+            # Mark as description mapped (manual correction)
+            result_df.at[idx, 'desc_mapped'] = True
+            # Append a note in the flags column indicating manual correction
+            note = result_df.at[idx, 'flags']
+            if note:
+                note = f"{note}; user corrected"
+            else:
+                note = "user corrected"
+            result_df.at[idx, 'flags'] = note
     else:
         st.success("Nessuna anomalia rilevata nei nuovi ordini.")
 
