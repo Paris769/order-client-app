@@ -174,10 +174,27 @@ def main() -> None:
     st.subheader("Risultati dell'analisi")
     st.dataframe(result_df)
 
+    # Offer the user a chance to flag incorrect matches.
+    # For each row in the results, present a checkbox labelled with the
+    # description and the suggested code.  A True value indicates that the
+    # user considers the suggested mapping to be wrong.  The selections are
+    # stored in a new column ``user_flagged`` on ``result_df``.
+    st.markdown("**Spunta le righe con articoli associati erroneamente:**")
+    user_flags: List[bool] = []
+    for idx, row in result_df.iterrows():
+        label = f"{row['item_description']} (codice suggerito: {row['item_code']})"
+        # Use a unique key per row to preserve checkbox state across reruns
+        is_wrong = st.checkbox(label, key=f"user_flag_{idx}")
+        user_flags.append(is_wrong)
+    # Append the user flags to the DataFrame.  This creates a new boolean column
+    # ``user_flagged`` indicating which rows were manually marked as incorrect.
+    result_df["user_flagged"] = user_flags
+
     # Show flagged rows
-    flagged = result_df[result_df["flags"] != ""]
+    # Combine system flags (non‑empty ``flags`` column) with user feedback.
+    flagged = result_df[(result_df["flags"] != "") | (result_df["user_flagged"] == True)]
     if not flagged.empty:
-        st.subheader("Righe con avvisi")
+        st.subheader("Righe con avvisi o segnalate dall'utente")
         st.dataframe(flagged)
     else:
         st.success("Nessuna anomalia rilevata nei nuovi ordini.")
