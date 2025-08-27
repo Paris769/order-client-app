@@ -26,6 +26,7 @@ from sap_exporter import export_to_sap
 
 
 def main() -> None:
+    """Entry point for the Streamlit application."""
     st.set_page_config(page_title="Order Audit App", layout="wide")
     st.title("Order Audit App")
     st.write(
@@ -47,7 +48,8 @@ def main() -> None:
     )
     # Input for default customer code (for files that don't contain it)
     default_customer_code = st.sidebar.text_input(
-        "Codice cliente predefinito per file senza colonna cliente", value=""
+        "Codice cliente predefinito per file senza colonna cliente",
+        value="",
     )
 
     new_files = st.sidebar.file_uploader(
@@ -77,7 +79,9 @@ def main() -> None:
         return
 
     if hist_df.empty:
-        st.warning("Lo storico degli ordini sembra vuoto o non contiene le colonne attese.")
+        st.warning(
+            "Lo storico degli ordini sembra vuoto o non contiene le colonne attese."
+        )
         return
 
     st.sidebar.success(f"Storico caricato: {len(hist_df)} righe")
@@ -89,25 +93,25 @@ def main() -> None:
     # Instantiate matcher
     matcher = OrderMatcher(hist_df)
 
-        # Slider per coefficiente di similitudine descrizione
+    # Slider per coefficiente di similitudine descrizione
     sim_threshold = st.sidebar.slider(
         "Coefficiente di similitudine descrizione",
         min_value=0.0,
         max_value=1.0,
         value=0.30,
         step=0.05,
-        help="Modifica questa soglia per affinare il matching sulla descrizione"
+        help="Modifica questa soglia per affinare il matching sulla descrizione",
     )
+    # Slightly lower threshold for customer-specific matching
     cust_threshold = sim_threshold * 0.8
 
     # Collect and parse all new orders from uploaded files and manual text
     parsed_orders: List[pd.DataFrame] = []
+
     # Parse uploaded files if any
     if new_files:
         for uploaded in new_files:
             try:
-                # Use pathlib to determine the file suffix instead of os.path, to avoid
-                # relying on the os module which can be sandboxed on some platforms.
                 suffix = Path(uploaded.name).suffix.lower()
                 df: Optional[pd.DataFrame] = None
                 if suffix in [".xls", ".xlsx", ".csv"]:
@@ -130,6 +134,7 @@ def main() -> None:
                     parsed_orders.append(df)
             except Exception as e:
                 st.warning(f"Errore nel parsing di {uploaded.name}: {e}")
+
     # Parse manual text input if provided
     if manual_text and manual_text.strip():
         try:
@@ -150,16 +155,25 @@ def main() -> None:
     if not parsed_orders:
         st.info("Nessun nuovo ordine valido da analizzare.")
         return
+
     # Concatenate all parsed orders
     new_df = pd.concat(parsed_orders, ignore_index=True)
+
     # Display new orders
     st.subheader("Nuovi ordini caricati")
     st.dataframe(new_df)
 
     # Match against history
-  #.match(, cust_desc_threshold=cust_threshold, global_desc_threshold=sim_thresholdnew_df)
+    result_df = matcher.match(
+        new_df,
+        cust_desc_threshold=cust_threshold,
+        global_desc_threshold=sim_threshold,
+    )
+
+    # Display results
     st.subheader("Risultati dell'analisi")
-      result_df = matcher.match(new_df, cust_desc_threshold=cust_threshold, global_desc_threshold=sim_threshold)
+    st.dataframe(result_df)
+
     # Show flagged rows
     flagged = result_df[result_df["flags"] != ""]
     if not flagged.empty:
@@ -169,13 +183,9 @@ def main() -> None:
         st.success("Nessuna anomalia rilevata nei nuovi ordini.")
 
     # Offer download
-    # Export the SAP-ready DataFrame to a temporary file in a writable
-    # directory. Writing to /home/oai/share is not allowed on Streamlit Cloud.
     buffer = BytesIO()
     import tempfile  # use tempfile to determine a writable temporary directory
-    # Determine a temporary path for the export file.
     temp_dir = tempfile.gettempdir()
-    # Build the temporary file path using pathlib instead of os.path.join
     temp_path = str(Path(temp_dir) / "sap_export.xlsx")
     export_path = export_to_sap(result_df, path=temp_path)
     # Read the file into the BytesIO buffer
