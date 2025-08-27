@@ -149,7 +149,12 @@ class OrderMatcher:
             )
         self.cust_desc_to_code = cust_desc_to_code
 
-        # Reverse mapping: customer → set of codes purchased (used to restrict search domain)
+        # Reverse mapping: customer → list of codes purchased (used to restrict search domain).
+        # We store codes as a list for each customer; converting to a set when checking
+        # membership allows us to quickly determine whether a given code has been
+        # purchased by a customer.  This mapping is central to the initial pass
+        # of order matching, as we prioritise codes that a customer has previously
+        # ordered over descriptions.
         self.customer_codes: Dict[str, List[str]] = (
             self.history.groupby("customer_code")["item_code"]
             .apply(lambda s: [str(c) for c in s])
@@ -328,7 +333,12 @@ class OrderMatcher:
     # ----------------------------------------------------------------------
     # Main matching routine
 
-    def match(self, orders_df: pd.DataFrame) -> pd.DataFrame:
+    def match(
+        self,
+        orders_df: pd.DataFrame,
+        cust_desc_threshold: float = 0.25,
+        global_desc_threshold: float = 0.30,
+    ) -> pd.DataFrame:
         """Assign item codes and anomaly flags to a new orders DataFrame.
 
         Returns a DataFrame with additional columns:
@@ -354,21 +364,39 @@ class OrderMatcher:
 
         for idx, row in df.iterrows():
             cust = str(row.get("customer_code"))
-            code = str(row.get("item_code")) if row.get("item_code") not in [None, "None", "nan", "NaN", ""] else None
+            # normalise provided code; treat empty strings and various 'None' representations as missing
+            raw_code = row.get("item_code")
+            code = None
+            if raw_code not in [None, "None", "nan", "NaN", ""]:
+                code = str(raw_code)
             desc = str(row.get("item_description") or "")
-            # If code exists in history, skip
-            if code and (code, cust) in zip(self.history["item_code"], self.history["customer_code"]):
+
+            # If a code was provided, accept it only if it exists among the codes previously
+            # purchased by this customer.  Otherwise, treat it as missing and fall back to
+            # description-based matching.  This prevents mis-assigned codes from being blindly
+            # accepted and enforces the "code first" matching policy per customer.
+            cust_codes = set(self.customer_codes.get(cust, []))
+            if code and code in cust_codes:
+                # Update the description to the canonical one for the code
+                canon_desc = self.code_to_desc.get(code)
+                if canon_desc:
+                    df.at[idx, "item_description"] = canon_desc
+                # No mapping needed; proceed to next row
                 continue
+            else:
+                # Provided code is either missing or not previously purchased by this customer.
+                # Remove it to trigger the description-based matching logic below.
+                df.at[idx, "item_code"] = None
 
             desc_lower = desc.lower()
             mapped_code: Optional[str] = None
 
-            # (1) exact per‑customer match on description
+            # (1) Exact per-customer match on description
             key_cust_exact = (cust, desc_lower)
             if key_cust_exact in self.cust_desc_to_code:
                 mapped_code = self.cust_desc_to_code[key_cust_exact]
             else:
-                # (2) fuzzy per‑customer match with difflib
+                # (2) Fuzzy per-customer match with difflib
                 cust_desc_keys = [k for k in self.cust_desc_to_code.keys() if k[0] == cust]
                 if cust_desc_keys:
                     matches = difflib.get_close_matches(
@@ -379,18 +407,18 @@ class OrderMatcher:
                     )
                     if matches:
                         mapped_code = self.cust_desc_to_code[(cust, matches[0])]
-                # (3) token/numeric similarity per customer
+                # (3) Token/numeric similarity per customer
                 if mapped_code is None:
                     mapped_code = self._find_similar_code_for_customer(
                         cust=cust,
                         description=desc_lower,
                         used_codes=used_codes_in_pass,
-                        threshold=0.25,
+                        threshold=cust_desc_threshold,
                     )
-            # (4) exact global match on description
+            # (4) Exact global match on description
             if mapped_code is None and desc_lower in self.global_desc_to_code:
                 mapped_code = self.global_desc_to_code[desc_lower]
-            # (5) fuzzy global match
+            # (5) Fuzzy global match
             if mapped_code is None:
                 global_keys = list(self.global_desc_to_code.keys())
                 matches = difflib.get_close_matches(
@@ -401,12 +429,12 @@ class OrderMatcher:
                 )
                 if matches:
                     mapped_code = self.global_desc_to_code[matches[0]]
-            # (6) token/numeric global similarity
+            # (6) Token/numeric global similarity
             if mapped_code is None:
                 mapped_code = self._find_similar_code(
                     description=desc_lower,
                     used_codes=used_codes_in_pass,
-                    threshold=0.30,
+                    threshold=global_desc_threshold,
                 )
             # At this point, mapped_code may still be None; if so, try again without threshold
             if mapped_code is None:
@@ -437,13 +465,13 @@ class OrderMatcher:
                     cust=cust,
                     description=desc.lower(),
                     used_codes=used_codes_overall,
-                    threshold=0.25,
+                    threshold=cust_desc_threshold,
                 )
                 if not best:
                     best = self._find_similar_code(
                         description=desc.lower(),
                         used_codes=used_codes_overall,
-                        threshold=0.30,
+                        threshold=global_desc_threshold,
                     )
                 if not best:
                     # no threshold: always suggest a code
