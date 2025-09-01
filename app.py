@@ -15,12 +15,106 @@ from __future__ import annotations
 
 from pathlib import Path
 from io import BytesIO
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
 
 from parsers import parse_excel, parse_pdf, parse_text
+import subprocess
+import re
+import tempfile
+
+# ---------------------------------------------------------------------
+# Helper to parse PDFs with Italian headers
+def parse_pdf_flexible(uploaded_file) -> pd.DataFrame:
+    """Parse a PDF with flexible header detection.
+
+    This function is a fallback parser for PDF order confirmations where
+    the header columns are labelled in Italian (e.g. ``Articolo`` and
+    ``Qta``) rather than the English ``Item``/``Qty`` that the default
+    ``parse_pdf`` looks for. It uses the ``pdftotext`` command with
+    ``-layout`` to extract text and then applies heuristics similar to
+    ``parse_pdf`` but with extended header detection.
+
+    Parameters
+    ----------
+    uploaded_file: file‑like
+        A Streamlit uploaded file or a filesystem path.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns ``item_code``, ``item_description`` and
+        ``qty_ordered``.
+    """
+    try:
+        # Read bytes from the uploaded file or treat as path
+        if hasattr(uploaded_file, "read"):
+            data = uploaded_file.read()
+            # Write to a temporary file for pdftotext
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(data)
+                file_path = tmp.name
+        else:
+            file_path = str(uploaded_file)
+        # Extract layout‑preserved text
+        output = subprocess.check_output(["pdftotext", "-layout", file_path, "-"], text=True)
+        lines = output.split("\n")
+        rows: List[Dict[str, Optional[str]]] = []
+        qty_regex = re.compile(r"(\d+,\d+)")
+        capture = False
+        for raw in lines:
+            line = raw.rstrip()
+            if not line:
+                continue
+            lower = line.lower()
+            # Start capturing when encountering a header containing item/artic and qty/qta
+            if not capture:
+                has_item = ("item" in lower) or ("artic" in lower)
+                has_qty = ("qty" in lower) or ("qta" in lower) or ("quant" in lower)
+                has_vendor = ("vendor" in lower) or ("fornitore" in lower)
+                if (has_item and has_qty) or (has_vendor and has_qty):
+                    capture = True
+                continue
+            # Stop capturing at totals or footer lines (English or Italian)
+            if any(key in lower for key in ["net total", "grand net total", "delivery date", "totale"]):
+                break
+            # Skip non‑product lines
+            if "hsn code" in lower or "reference" in lower:
+                continue
+            m = qty_regex.search(line)
+            if not m:
+                continue
+            qty_str = m.group(1)
+            prefix = line[: m.start()].rstrip()
+            collapsed = re.sub(r"\s{2,}", " ", prefix.strip())
+            tokens = collapsed.split() if collapsed else []
+            code: Optional[str] = None
+            description: str = collapsed
+            if tokens:
+                first_tok = tokens[0]
+                # If the first token contains a digit treat it as a vendor code
+                if re.search(r"\d", first_tok):
+                    code = first_tok
+                    description = " ".join(tokens[1:]).strip()
+                else:
+                    description = collapsed
+            try:
+                qty_val = float(qty_str.replace(".", "").replace(",", "."))
+            except Exception:
+                qty_val = None
+            rows.append(
+                {
+                    "item_code": code,
+                    "item_description": description,
+                    "qty_ordered": qty_val,
+                }
+            )
+        return pd.DataFrame(rows)
+    except Exception:
+        # On any error, return empty DataFrame
+        return pd.DataFrame()
 from matcher import OrderMatcher
 from sap_exporter import export_to_sap
 
@@ -117,7 +211,11 @@ def main() -> None:
                 if suffix in [".xls", ".xlsx", ".csv"]:
                     df = parse_excel(uploaded)
                 elif suffix == ".pdf":
+                    # First try the default PDF parser
                     df = parse_pdf(uploaded)
+                    # If no rows were extracted, fall back to a flexible parser
+                    if df is not None and df.empty:
+                        df = parse_pdf_flexible(uploaded)
                 elif suffix in [".txt", ".text"]:
                     df = parse_text(uploaded)
                 else:
