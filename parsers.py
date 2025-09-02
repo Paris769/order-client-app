@@ -360,4 +360,114 @@ def parse_pdf(uploaded_file) -> pd.DataFrame:
             "item_description": description,
             "qty_ordered": qty_val,
         })
-    return pd.DataFrame(rows)
+    retu
+    
+    
+    
+    
+# --- Added new robust PDF parsing functions ---
+import subprocess
+
+# Regular expression to match numbers with optional thousand separators and comma decimals
+_NUM = re.compile(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+")
+
+def _to_float(num: str) -> float | None:
+    """
+    Convert a number string with optional thousand separators and comma decimals to a float.
+    Returns None if conversion fails.
+    """
+    try:
+        return float(num.replace(".", "").replace(",", "."))
+    except Exception:
+        return None
+
+def _pdftotext_layout(uploaded_file) -> list[str]:
+    """
+    Extract text with layout preserved using the `pdftotext` utility.
+    Handles both file-like objects and file paths. Returns a list of stripped lines.
+    """
+    if hasattr(uploaded_file, "read"):
+        data = uploaded_file.read()
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(data)
+            path = tmp.name
+    else:
+        path = str(uploaded_file)
+    out = subprocess.check_output(["pdftotext", "-layout", path, "-"], text=True, errors="ignore")
+    return [ln.rstrip() for ln in out.split("\n")]
+
+def parse_pdf_hardcore(uploaded_file) -> pd.DataFrame:
+    """
+    Highly tolerant parser for PDF order confirmations with varied layouts.
+    Recognises quantities such as '1,00 6 x each', '10,00 Each', '1,00 Kilogram'
+    and discards lines containing 'HSN Code' or 'Reference'.
+    Uses segmentation on multiple spaces to separate description and quantity fields.
+    """
+    lines = _pdftotext_layout(uploaded_file)
+    rows: list[dict[str, object]] = []
+
+    def is_product_line(s: str) -> bool:
+        low = s.lower()
+        if "hsn code" in low or "reference" in low:
+            return False
+        return any(k in low for k in [" each", "x each", " kilogram", " kg", " ct", " cf", "ct=", "cf="])
+
+    for raw in lines:
+        line = " ".join(raw.split())
+        if not line or not is_product_line(line):
+            continue
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) < 2:
+            parts = [line]
+        desc = parts[0].strip()
+        desc = re.sub(r"\bml\b$", "", desc, flags=re.I).strip()
+        qty_val = None
+        for seg in parts[1:]:
+            m = _NUM.search(seg.replace(" ", ""))
+            if m:
+                qty_val = _to_float(m.group(0))
+                break
+        if desc and qty_val is not None:
+            rows.append({"item_code": None, "item_description": desc, "qty_ordered": qty_val})
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["item_description"] = df["item_description"].astype(str).str.strip()
+        df["qty_ordered"] = pd.to_numeric(df["qty_ordered"], errors="coerce")
+        df = df.dropna(subset=["item_description", "qty_ordered"]).reset_index(drop=True)
+    return df
+
+def parse_pdf_best_effort(uploaded_file) -> pd.DataFrame:
+    """
+    Try multiple PDF parsers and return the one with the most valid rows:
+    - parse_pdf (standard parser)
+    - parse_pdf_flexible (if available)
+    - parse_pdf_hardcore (new robust parser)
+    """
+    candidates: list[pd.DataFrame] = []
+    try:
+        df1 = parse_pdf(uploaded_file)
+        if isinstance(df1, pd.DataFrame):
+            candidates.append(df1)
+    except Exception:
+        pass
+    try:
+        # Attempt to use parse_pdf_flexible from app.py if it exists
+        from app import parse_pdf_flexible  # type: ignore
+        df2 = parse_pdf_flexible(uploaded_file)
+        if isinstance(df2, pd.DataFrame):
+            candidates.append(df2)
+    except Exception:
+        pass
+    try:
+        df3 = parse_pdf_hardcore(uploaded_file)
+        if isinstance(df3, pd.DataFrame):
+            candidates.append(df3)
+    except Exception:
+        pass
+    if not candidates:
+        return pd.DataFrame()
+    best = max(candidates, key=lambda d: len(d.index))
+    cols = [c for c in ["item_code", "item_description", "qty_ordered"] if c in best.columns]
+    return best[cols].copy() if cols else best.copy()
