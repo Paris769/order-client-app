@@ -211,21 +211,30 @@ def main() -> None:
                 if suffix in [".xls", ".xlsx", ".csv"]:
                     df = parse_excel(uploaded)
                 elif suffix == ".pdf":
-                    # First try the default PDF parser.  Some PDFs may not have
-                    # the English headers ("Item", "Qty"), so the default
-                    # parser can return an empty DataFrame or raise an error.
-                    df = None
+                    # PDF files can have different header formats.  We first
+                    # attempt to parse using the default parser.  Then we
+                    # parse using the flexible parser that recognises Italian
+                    # headers (e.g. "Articolo", "Qta", "Fornitore").  The
+                    # parser that yields the most rows is selected.  This
+                    # approach ensures that partially parsed data (e.g. from
+                    # the default parser mis‑interpreting a non‑English header)
+                    # does not block the more robust flexible parser.
+                    df_default: Optional[pd.DataFrame] = None
                     try:
-                        df = parse_pdf(uploaded)
+                        df_default = parse_pdf(uploaded)
                     except Exception:
-                        # Ignore errors from the standard parser and fall back
-                        df = None
-                    # If no rows were extracted (empty or None), fall back to
-                    # the flexible parser that recognises Italian headers (e.g.
-                    # "Articolo", "Qta", "Fornitore").  This ensures PDFs
-                    # like the Optima order confirmations are parsed correctly.
-                    if df is None or df.empty:
-                        df = parse_pdf_flexible(uploaded)
+                        df_default = None
+                    # Always run the flexible parser as well
+                    df_flex = parse_pdf_flexible(uploaded)
+                    # Choose the result with more rows.  If the default parser
+                    # failed or returned an empty DataFrame, prefer the
+                    # flexible parser.  Otherwise, if the flexible parser
+                    # extracts more rows than the default, use it; this
+                    # prevents mis‑parsed PDFs from bypassing the fallback.
+                    if df_default is None or df_default.empty or (df_flex is not None and len(df_flex) > len(df_default)):
+                        df = df_flex
+                    else:
+                        df = df_default
                 elif suffix in [".txt", ".text"]:
                     df = parse_text(uploaded)
                 else:
