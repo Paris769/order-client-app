@@ -20,13 +20,12 @@ from typing import List, Optional, Tuple, Dict
 import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
 
-from parsers import parse_excel, parse_pdf, parse_te, parse_pdf_best_effortxt
+from parsers import parse_excel, parse_pdf, parse_text, parse_pdf_best_effort
 import subprocess
-import 
 import tempfile
 
-# ---------------------------------------------------------------------
-# Helper to parse PDFs with Italian headers
+
+
 def parse_pdf_flexible(uploaded_file) -> pd.DataFrame:
     """Parse a PDF with flexible header detection.
 
