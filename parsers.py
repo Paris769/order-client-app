@@ -360,14 +360,14 @@ def parse_pdf(uploaded_file) -> pd.DataFrame:
             "item_description": description,
             "qty_ordered": qty_val,
         })
-    retu
     
+   return pd.DataFrame(rows)
     
     
     
 # --- Added new robust PDF parsing functions ---
 import subprocess
-
+.
 # Regular expression to match numbers with optional thousand separators and comma decimals
 _NUM = re.compile(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+")
 
