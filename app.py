@@ -211,10 +211,20 @@ def main() -> None:
                 if suffix in [".xls", ".xlsx", ".csv"]:
                     df = parse_excel(uploaded)
                 elif suffix == ".pdf":
-                    # First try the default PDF parser
-                    df = parse_pdf(uploaded)
-                    # If no rows were extracted, fall back to a flexible parser
-                    if df is not None and df.empty:
+                    # First try the default PDF parser.  Some PDFs may not have
+                    # the English headers ("Item", "Qty"), so the default
+                    # parser can return an empty DataFrame or raise an error.
+                    df = None
+                    try:
+                        df = parse_pdf(uploaded)
+                    except Exception:
+                        # Ignore errors from the standard parser and fall back
+                        df = None
+                    # If no rows were extracted (empty or None), fall back to
+                    # the flexible parser that recognises Italian headers (e.g.
+                    # "Articolo", "Qta", "Fornitore").  This ensures PDFs
+                    # like the Optima order confirmations are parsed correctly.
+                    if df is None or df.empty:
                         df = parse_pdf_flexible(uploaded)
                 elif suffix in [".txt", ".text"]:
                     df = parse_text(uploaded)
